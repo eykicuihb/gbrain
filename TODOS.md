@@ -106,13 +106,15 @@ The eng-review + Codex outside-voice narrowed the wave to these deferrals:
   (its OpenAI-compat route is `/v1beta/openai`). Verify the correct `@ai-sdk/google` suffix,
   then add `google` to the helper. Where: `src/core/ai/gateway.ts:resolveNativeBaseUrl`.
 - [ ] **P3 — Fold Voyage/Google/LiteLLM/OpenRouter API keys into `buildGatewayConfig`.**
+  PARTIALLY DONE 2026-11-17 sweep — Voyage + OpenRouter landed in build-gateway-config.ts (:40, :46); Google and LiteLLM keys are still absent.
   It folds only OPENAI/ANTHROPIC/ZEROENTROPY file-plane keys today, so `config.json`-set keys
   for other providers only work if also in `process.env`. Extend the mapping. Where:
   `src/core/ai/build-gateway-config.ts`.
 - [ ] **P3 — OpenRouter per-model custom-dim handling.** OpenRouter declares recipe-wide
   `dims_options` and mixes fixed-dim + arbitrary models, so it's excluded from `trust_custom_dims`.
   A per-model story would let OpenRouter accept custom dims for models that support them.
-- [ ] **P1 — Gateway subagent-loop tool-result persistence + Date normalization (#2273/#2256).**
+- [x] **P1 — Gateway subagent-loop tool-result persistence + Date normalization (#2273/#2256).**
+  CLOSED 2026-11-17 sweep — onToolResultTurn persists the tool-result turn before push (gateway.ts:3844-3848); Date normalization via toJsonSafe (gateway.ts:2765-2783); pinned by test/ai/gateway-tool-loop.test.ts + test/e2e/subagent-gateway-resume-reconciliation.test.ts. Duplicate filing of the wave closed in the gateway toolLoop entry below.
   Confirmed crash-block: non-Anthropic subagent jobs dead-letter after any interruption
   (tool-result user turns aren't persisted; raw Date values fail the AI SDK's strict JSON
   check). Larger self-contained change with 6 competing community PRs
@@ -205,6 +207,7 @@ job) and sync. See CLAUDE.md "Pace Mode".
   supervisor-detection downgrade. Today these inherit config/env pacing only when
   they call `runEmbedCore`.
 - [ ] **P1-companion — Supervisor concurrency 3→2 + job-kind slot fairness (E7).**
+  HALF-LANDED 2026-11-17 sweep — supervisor concurrency 3→2 shipped (supervisor.ts:148); queue.ts:685 claim is still plain FIFO with no lane reservation.
   The daemon-side root cause the external wrapper's probe was blind to:
   `embed-backfill`/`autopilot-cycle` jobs can occupy all supervisor slots
   (`:215` below). Pacing makes backfills safe; this fixes the residual death rate.
@@ -238,29 +241,30 @@ job) and sync. See CLAUDE.md "Pace Mode".
 
 ## gbrain#2200 federated-read follow-ups (filed v0.42.46.0)
 
-- [ ] **P1 — Close the federated-read scope on the remaining same-class by-slug read ops.**
+- [x] **P1 — Close the federated-read scope on the remaining same-class by-slug read ops.**
   v0.42.46.0 (#2200) routed `get_page` tags + `get_tags` / `get_links` / `get_backlinks` /
   `get_timeline` through the federated source scope and taught the engine methods to honor
   `sourceIds[]`. The adversarial review (Codex + Claude) flagged sibling read ops in the
-  SAME class that still use scalar-only `ctx.sourceId ? {sourceId} : {}` and never thread
-  `ctx.auth.allowedSources`: `get_chunks`, `get_raw_data`, `get_versions`, `resolve_slugs`
-  (the standalone op — `resolve_slugs` passes NO scope at all), plus (per the v0.42.55.0
-  eng-review codex pass) `takes_search` (`operations.ts:1727` — holder-allowlist only, no
-  `sourceScopeOpts`) and `code_def` (`operations.ts:4155` — brain-wide raw SQL over
-  `content_chunks`; confirm whether brain-wide is intentional before scoping). A remote
-  federated client (grant set, dispatch-default `ctx.sourceId='default'`) reads these against
-  `default` or unscoped, not its grant.
-  - **Why:** same cross-source correctness/isolation class #2200 targets; a federated client
-    can't read chunks/raw-data/versions for an authorized non-default source, `resolve_slugs`
-    can fuzzy-resolve across all sources, and `takes_search`/`code_def` query without the grant.
-    The #2399 close-list deliberately did NOT blanket-close #1371/#2200 because of these residual
-    surfaces — close those issues only after this TODO lands.
-  - **How to start:** mirror the #2200 pattern — route each handler through `sourceScopeOpts(ctx)`
-    (or `linkReadScopeOpts` if a far endpoint exists), add `sourceIds?: string[]` to the engine
-    methods (`getChunks` / `getRawData` / `getVersions` / `resolveSlugs` / the takes-search +
-    code-def queries) with `source_id = ANY($::text[])` precedence, and add federated/isolation
-    tests + engine-parity arms.
-  - **Depends on:** nothing; #2200 established the pattern and the `linkReadScopeOpts` helper.
+  SAME class that still used scalar-only `ctx.sourceId ? {sourceId} : {}` and never threaded
+  `ctx.auth.allowedSources`. CLOSED — investigation narrowed the real gaps (the TODO had
+  drifted: `resolve_slugs` was already closed by #3242's `federatedSearchScope`, and
+  `takes_search`/`takes_list`/`takes_scorecard`/`takes_calibration` already route through
+  `sourceScopeOpts`):
+  - `get_chunks` / `get_raw_data` / `get_versions`: handlers now route through
+    `sourceScopeOpts(ctx)`; engine methods (`getChunks` / `getRawData` / `getVersions`)
+    gained a federated `sourceIds?: string[]` branch with `source_id = ANY($::text[])`
+    precedence over the scalar, in BOTH engines (parity-locked).
+  - `code_def` / `code_refs` (brain-wide raw SQL over `content_chunks` — same class found
+    during investigation): remote callers now scope to their grant via `sourceScopeOpts` and
+    FAIL CLOSED (`permission_denied`) when no source is in scope, matching
+    `resolveCodeIntelScope`'s empty-scope arm. Trusted local CLI callers keep the documented
+    brain-wide contract (`findCodeDef`/`findCodeRefs` accept `sourceId`/`sourceIds`).
+  - Tests: `test/by-slug-federated-scope.test.ts` (15 isolation/precedence/fail-closed
+    cases, same-slug cross-source bleed guards) + federated + scalar arms for
+    `getChunks`/`getRawData`/`getVersions`/`findCodeDef`/`findCodeRefs` in the
+    `describeBoth` #2200 parity block (DATABASE_URL-gated).
+  - Note: #1371/#2200 close-lists can now land — these were the residual surfaces they
+    deliberately skipped.
 
 ## Spend-controls wave follow-ups (filed v0.42.45.0, #2139)
 
@@ -505,6 +509,7 @@ context). Deliberately scoped OUT of that PR. See plan + GSTACK REVIEW REPORT at
   a post-classification fallback). Issue #1861 option 2.
 
 - [ ] **P3 — Audit remaining `unnest(${arr}::text[])` write sites.** `setPageAliases`
+  HALF-LANDED 2026-11-17 sweep — addCodeEdges was reworked to per-row binds; setPageAliases still unnest(...::text[]) in both engines (the remaining half).
   (alias_norm) and `addCodeEdges` (symbol-qualified names + `metas::jsonb[]`) still
   bind through text-array literals. They carry normalized identifiers / symbol names,
   not free prose, so the crash risk is far lower than calendar context — but they are
@@ -628,28 +633,24 @@ deliberately scoped OUT of the tool-schema fix (it's pre-existing + a separate
 structural change). Plan + GSTACK REVIEW REPORT at
 `~/.claude/plans/system-instruction-you-are-working-abstract-willow.md`.
 
-- [ ] **P1 — Gateway toolLoop crash-replay sends a malformed ModelMessage
-  history.** The gateway path never persists the tool-result feedback message:
-  `toolLoop` pushes `{role:'user', content: toolResultBlocks}` with `void
-  messageIdx` and NO persistence callback, so only assistant turns reach
-  `subagent_messages` (via `onAssistantTurn`). On any multi-turn resume,
-  `loadPriorMessages` (`subagent.ts:769`) returns
-  `[user, assistant(tool-call), assistant(...), ...]` with the tool-result
-  messages MISSING — a history the real AI SDK v6 rejects ("tool result missing
-  for tool call"). The direct-Anthropic path reconciles this at
-  `subagent.ts:334-418` (synthesize + persist the tool-result turn before the
-  first chat call); the gateway branch does not. **Fresh runs — the actual
-  #1782/#1764 reports — are unaffected**, which is why the tool-schema fix
-  shipped without it. Two fix options: (a) add an `onToolResults` persistence
-  callback to `toolLoop` so the feedback message lands in `subagent_messages`,
-  or (b) mirror the direct-path reconciliation in the gateway branch of
-  `subagent.ts` before the first `gatewayToolLoop` chat. Either is a structural
-  change to the replay contract — own PR, own review. Caught because every
-  toolLoop/replay test stubs the transport and never inspects the input
-  messages; pair the fix with a `MockLanguageModelV3 + generateText` replay test
-  (the seam landed in `test/ai/gateway-tools-schema.test.ts`).
+- [x] **P1 — Gateway toolLoop crash-replay sends a malformed ModelMessage
+  history.** DONE (fix-wave A, landed as `test/e2e/subagent-gateway-resume-reconciliation.test.ts`'s
+  header documents): the gateway path now forward-persists the tool-result
+  feedback turn — `toolLoop` fires an `onToolResultTurn` callback with
+  persist-before-push write-ordering (gateway.ts, before the user message is
+  appended to in-memory history), and `subagent.ts` implements it into
+  `subagent_messages`. Resume-side, the gateway branch also RECONCILES an
+  already-corrupted transcript by rebuilding missing tool-result turns from
+  settled `subagent_tool_executions` (re-dispatching idempotent-pending tools,
+  throwing on non-idempotent) — mirroring what the direct-Anthropic path already
+  did. Both halves pinned: `test/ai/gateway-tool-loop.test.ts` ("persists the
+  tool-result user turn via onToolResultTurn before the next chat") +
+  `test/e2e/subagent-gateway-resume-reconciliation.test.ts` (hermetic PGLite,
+  stubbed transport, AI_MissingToolResultsError regression class). TODO content
+  was stale when re-investigated 2026-11-17 — the fix pre-dated this audit.
 
-- [ ] **P2 — SkillOpt `best.md` not written in `--no-mutate` runs.** From PR
+- [x] **P2 — SkillOpt `best.md` not written in `--no-mutate` runs.** From PR
+  CLOSED 2026-11-17 sweep — orchestrator.ts:571-576 else-branch calls writeProposed, and version-store.ts:184-192 atomically writes BOTH best.md and proposed.md without touching SKILL.md.
   #1708 (scoped out of the tool-schema wave as tangential): in `--no-mutate`
   SkillOpt runs the accepted proposal isn't persisted because `acceptCandidate`
   is gated by the mutate decision. Write it explicitly via `atomicWrite`
@@ -708,7 +709,8 @@ Filed from the v0.42.15.0 wave (#1784, decouple primary output from
 `process.stdout.isTTY`). Both are the same axis-conflation class the wave fixed
 but were deliberately scoped OUT — neither is a #1784 regression.
 
-- [ ] **P2 — `sync.ts:2491` emits a JSON cost-refusal even without `--json`.** The
+- [x] **P2 — `sync.ts:2491` emits a JSON cost-refusal even without `--json`.** The
+  CLOSED 2026-11-17 sweep — sync.ts now auto-defers in non-TTY (never exit 2) and splits JSON formatting on explicit --json. Behavior evolved beyond the original refusal ask; implemented inline, not via buildCostRefusal.
   `gbrain sync --all` cost gate has the byte-identical pattern that
   `reindex-code.ts:457` had before #1784: non-TTY or `--json` → JSON envelope +
   exit 2, conflating "refuse to spend" with "machine-readable output." The
@@ -762,6 +764,7 @@ complete and tested; these are hardening/cleanup.
   policy must be applied in two places. Extract a shared `promoteCandidate({...})`. Deferred
   this wave to avoid a >20-line refactor of freshly-tested accept-path code.
 - [ ] **P2 — Harden bundled-skill detection.** `getBundledSkillContext`
+  PARTIALLY HARDENED 2026-11-17 sweep — a realpath compare was added to bundled-skill-gate.ts, but the tier gate (source === 'install_path', :40) remains.
   (`src/core/skillopt/bundled-skill-gate.ts`) only sets `isBundled` when the skills dir was
   resolved via the `install_path` tier. If the same bundled `skills/` is found via
   `cwd_walk_up` / `repo_root` / `$GBRAIN_SKILLS_DIR`, `isBundled=false` and the D16 ENFORCE
@@ -961,13 +964,29 @@ infra and reaches into third-party packs that live outside the host skills dir.
 Deferred from the v0.41.34.0 wave (codex adversarial P1/P2 — documented tradeoffs,
 not blockers; the P0 source-isolation issues were fixed in-wave).
 
-- [ ] **P1 — Calibrate the `evidence` classifier.** `high_vector_match` is assigned
-  from `base_score >= 0.85`, but `base_score` is the pre-boost RRF/keyword/title/alias
-  pipeline score, not a pure cosine. A generic high-scoring page can read as
-  `create_safety='exists'`. Add a true vector-cosine signal (or a `keyword_exact`
-  exact-token check) so the evidence labels are grounded, not inferred from the blend.
-  File: `src/core/search/evidence.ts`. **Why:** the evidence contract is what stops
-  the duplicate-page class; mislabeled evidence weakens it.
+- [x] **P1 — Calibrate the `evidence` classifier.** FIXED — the vector arm is now
+  grounded on a TRUE signal instead of inferred from the blend:
+  - `cosineReScore` (hybrid.ts) already computed the real query↔chunk cosine for
+    its 0.7*normRrf + 0.3*cosine blend but discarded it — it now stamps the raw
+    cosine on the result as `vector_cosine` (new optional SearchResult field in
+    types.ts, alongside base_score in the attribution family).
+  - `classifyEvidence` (evidence.ts) checks `vector_cosine` FIRST when present:
+    `>= VECTOR_COSINE_FLOOR (0.75)` → `high_vector_match`, `>= VECTOR_COSINE_SOLID
+    (0.5)` → `keyword_exact`, else `weak_semantic`. A generic high base_score with
+    a weak true cosine no longer reads as `create_safety='exists'` — the exact
+    TODO failure case. When the stamp is absent (keyword-only paths, image-only
+    queries, stale callers) the legacy base_score bands apply verbatim, so no
+    caller regresses.
+  - `--explain` shows `vector_cosine=` next to base when stamped, so the dedup
+    decision is auditable.
+  - Tests: 8 new grounded-cosine cases in `test/search/evidence.test.ts` (19 total
+    pass), including the literal TODO case (base 0.86 + cosine 0.35 → unknown, not
+    exists). Search-area regression: 413 pass, 3 fail — the 3 are PRE-EXISTING
+    autocut-integration serial failures (verified via git stash: clean tree fails
+    identically; unrelated to this change).
+  - Note: thresholds (0.75/0.5) are first-principles picks (real embedding-pair
+    cosine concentrates ~[0.3, 0.6]); if `gbrain search stats` telemetry shows the
+    bands misfire in practice, tune the two constants — they are the only knobs.
 
 - [ ] **P1 — Page-bounded vector pagination.** `searchVector` innerLimit is
   `offset + max(limit*5, 100)` counted BEFORE `DISTINCT ON`, so on a dense page one
@@ -1231,7 +1250,8 @@ all are latent-debt cleanup.
 
 - [ ] **Config-write normalization.** Whenever a user writes `gbrain config set models.tier.deep anthropic/claude-opus-4-7` we silently store the slash form. v0.41.22.1 centralized the read-side via `splitProviderModelId`, but config writes still preserve whatever shape the user typed. Canonical form should be colon (`anthropic:claude-opus-4-7`). Fix: rewrite at config-write time in `src/core/config.ts`. Breaks existing config files that explicitly hold the slash form — defer to a v0.42+ config-migration wave that also handles the rewrite + once-per-process deprecation warn. Files: `src/core/config.ts`, `src/core/model-config.ts:saveConfig` path. Priority: P3 (latent, not user-visible).
 
-- [ ] **Non-Anthropic budget-tracker pricing.** PARTIALLY ADDRESSED by v0.42.25.0: `src/core/model-pricing.ts` is now the canonical multi-provider table (OpenAI / Google / Together / DeepSeek entries exist alongside Anthropic), and cross-modal-eval + takes-quality already price non-Anthropic models from it. REMAINING: `src/core/budget/budget-tracker.ts:lookupPricing` still routes only through the bare-keyed `ANTHROPIC_PRICING` view, so brainstorm + LSD users running budget gates against OpenAI / Gemini / OpenRouter still get `BUDGET_TRACKER_NO_PRICING` warn-once + bypass-gate (without `--max-cost`) OR `no_pricing` hard-fail (with `--max-cost`). Right fix: route `lookupPricing` through `canonicalLookup`. OpenRouter stays a special case (period-vs-dash key mismatch: their `claude-sonnet-4.6` won't match our `claude-sonnet-4-6`, and it intentionally misses to avoid pricing markup as native). Files: `src/core/budget/budget-tracker.ts`, `src/core/model-pricing.ts`. Priority: P2 (real user pain when running brainstorm against non-Anthropic).
+- [x] **Non-Anthropic budget-tracker pricing.** PARTIALLY ADDRESSED by v0.42.25.0: `src/core/model-pricing.ts` is now the canonical multi-provider table (OpenAI / Google / Together / DeepSeek entries exist alongside Anthropic), and cross-modal-eval + takes-quality already price non-Anthropic models from it. REMAINING: `src/core/budget/budget-tracker.ts:lookupPricing` still routes only through the bare-keyed `ANTHROPIC_PRICING` view, so brainstorm + LSD users running budget gates against OpenAI / Gemini / OpenRouter still get `BUDGET_TRACKER_NO_PRICING` warn-once + bypass-gate (without `--max-cost`) OR `no_pricing` hard-fail (with `--max-cost`). Right fix: route `lookupPricing` through `canonicalLookup`. OpenRouter stays a special case (period-vs-dash key mismatch: their `claude-sonnet-4.6` won't match our `claude-sonnet-4-6`, and it intentionally misses to avoid pricing markup as native). Files: `src/core/budget/budget-tracker.ts`, `src/core/model-pricing.ts`. Priority: P2 (real user pain when running brainstorm against non-Anthropic).
+  CLOSED 2026-11-17 sweep — the REMAINING ask landed: budget-tracker.ts lookupPricing ends with a canonicalLookup(modelId) fallback (non-Anthropic chat models resolve under --max-cost); OpenRouter intentional-miss preserved per spec; canonical normalization pinned by test/model-pricing.test.ts:66-95.
 
 - [x] **Eval-contradictions duplicate ANTHROPIC_PRICING consolidation.** **Completed:** v0.42.25.0 (2026-06-03). Deleted the local duplicate table in `src/core/eval-contradictions/cost-tracker.ts`; it now imports the canonical-derived `ANTHROPIC_PRICING` view and `pricingFor` preserves the silent-Haiku fallback (pinned by `test/eval-contradictions/cost-tracker-slash.test.ts`). Closed as part of the wider model-pricing unification.
 
@@ -1599,7 +1619,8 @@ PR bisectable.
 
 ## v0.41.10.1 fix-wave follow-ups (v0.42+)
 
-- [ ] **v0.42+: per-atom idempotency via deterministic atom slug.** The
+- [x] **v0.42+: per-atom idempotency via deterministic atom slug.** The
+  CLOSED 2026-11-17 sweep — extract-atoms.ts header documents per-atom idempotency via deterministic atomSlug() (~:863, source-date + title-hash) so putPage upserts naturally; the source-hash check was demoted to a cost fast-path. Not the exact slug formula proposed, but the functional ask is satisfied.
   v0.41.10.1 fix wave closed the duplicate-atoms bug class via source-hash
   existence check at the SOURCE level (skip the whole transcript/page if
   any atom row exists for `frontmatter.source_hash`). Known limitation
@@ -1737,7 +1758,8 @@ each can ship as its own wave without touching RLS.
   Cherry-pick starter: PR #1316 diff against `src/core/operations.ts`
   and `src/mcp/dispatch.ts`. Effort: human ~2 days / CC ~3 hours.
 
-- [ ] **T13b (P2) — Extract real operation names in mcp_request_log
+- [x] **T13b (P2) — Extract real operation names in mcp_request_log
+  CLOSED 2026-11-17 sweep — serve-http.ts:1871/1901/2029 insert the real op name into mcp_request_log.operation. Minor residual: the newer Bun transport logs a tools/call:<op> prefixed form.
   from #1316.** Pre-fix audit log records generic `tools/call` for
   every MCP request. #1316 carries the real op name (`get_page`,
   `put_page`, `submit_job`, etc.) into the `operation` column.
@@ -1847,7 +1869,8 @@ fixtures + scaling-skills tutorial. Two findings deferred:
   tests prove parser output, integration tests prove reachability, and the
   current docs don't bridge the two cleanly. Doc-only follow-up.
 
-- [ ] **P1 flake — audit-writer.test.ts week-boundary failure.** Caught
+- [x] **P1 flake — audit-writer.test.ts week-boundary failure.** Caught
+  CLOSED 2026-11-17 sweep — audit-writer.ts:194-199 derives the week file from the event's own ts (fix narrated in comment); test rewritten.
   during ship of v0.41.7.0. Test at `test/audit/audit-writer.test.ts:229`
   ("returns events from current week, filtered by ts cutoff") fails when
   real UTC date is in a different ISO week than the test's hardcoded
@@ -1891,7 +1914,8 @@ follow-ups, captured here so v0.42 starts informed.
   Pairs with the v0.42 chunk-quarantine for a complete cleanup story.
   Effort: human ~1 day / CC ~2 hours.
 
-- [ ] **v0.41 + 30 days — Threshold default validation post-deploy.**
+- [x] **v0.41 + 30 days — Threshold default validation post-deploy.**
+  CLOSED 2026-11-17 sweep — CHANGELOG.md:8068-8072 documents content_sanity.bytes_warn/block + GBRAIN_PAGE_WARN_BYTES/GBRAIN_PAGE_BLOCK_BYTES env overrides.
   Codex r1 #15 caught: we invented 50K warn / 500K block thresholds
   before measuring real corpus distribution. Move: run `gbrain sources
   audit <id>` on real source repos (start with Garry's own brain),
@@ -1928,7 +1952,8 @@ follow-ups, captured here so v0.42 starts informed.
   linear-time engine; native dep, build complications) or worker-
   thread per-pattern timeout (50ms cap, runtime overhead).
 
-- [ ] **post-v0.45 — HTML-density rule.** Dropped in v0.41 per Codex
+- [x] **post-v0.45 — HTML-density rule.** Dropped in v0.41 per Codex
+  CLOSED 2026-11-17 sweep — assessProse() (content-sanity.ts:296) strips code then counts tags via HTML_TAG_RE → high_markup flag at ratio > 0.85 (:75, :423-429).
   r1 #16. Was: flag pages where `<div>`/`<span>`/etc tag density is
   too high (raw HTML dump indicator). Requires careful handling of
   fenced code blocks, JSX/XML in technical notes, escaped HTML.
@@ -1991,7 +2016,8 @@ before the destination exists.
 
 The original 3 items as filed (kept for traceability):
 
-- [ ] **P0 — `gbrain eval gate <baseline.ndjson>` for CI.** The single most
+- [x] **P0 — `gbrain eval gate <baseline.ndjson>` for CI.** The single most
+  CLOSED 2026-11-17 sweep — src/commands/eval-gate.ts (thresholds from the baseline file, exit 0/1/2), registered in src/commands/eval.ts:41, tested in test/eval-gate.test.ts.
   load-bearing missing item across all 12 clusters. Fails the build on
   regression vs the last published BrainBench-Real baseline. Without it,
   every other eval surface is informational, not gating. Shape: reads
@@ -2013,7 +2039,8 @@ The original 3 items as filed (kept for traceability):
   `eval_capture_failures.reason` enum cleanup from the v0.25.0 P1 surgical
   hardenings list. Effort: human ~3 days / CC ~3 hours.
 
-- [ ] **P0 — Wire nightly quality probe into autopilot scheduler.** The
+- [x] **P0 — Wire nightly quality probe into autopilot scheduler.** The
+  CLOSED 2026-11-17 sweep — autopilot.ts:1136-1177 invokes runNightlyQualityProbe honoring autopilot.nightly_quality_probe.enabled; pinned by test/autopilot-nightly-probe-wiring.test.ts.
   phase ships callable (`src/core/cycle/nightly-quality-probe.ts`) with
   full DI surface; doctor surfaces outcomes; the audit JSONL rotates
   cleanly. What's NOT wired: `src/commands/autopilot.ts` doesn't invoke
@@ -2029,7 +2056,8 @@ not "knowledge brain that also indexes code." The five code-indexing
 TODOs below promoted from P2/P3 to P1. Plan reference: v0.21 Code
 Cathedral II was the last big push; this wave revives the trajectory.
 
-- [ ] **P1 — `.sql` file indexing (#1173).** Vendor `tree-sitter-sql.wasm`
+- [x] **P1 — `.sql` file indexing (#1173).** Vendor `tree-sitter-sql.wasm`
+  CLOSED 2026-11-17 sweep — tree-sitter-sql.wasm vendored in src/assets/wasm/grammars/, imported at src/core/chunkers/code.ts:83, '.sql' in CODE_EXTENSIONS (src/core/sync.ts:93).
   into `src/assets/wasm/grammars/`, extend sync walker's extension filter
   to include `.sql`, route through `importCodeFile()` with
   `page_kind='code'`. Verify-first slug round-trip before merging (codex
@@ -2341,6 +2369,7 @@ at plan time and got carved out:
 ## v0.40.3.0 follow-ups (v0.41+)
 
 - [ ] **v0.41+: drop the `--skip-failed` / `--retry-failed` + `--parallel > 1` restriction now that the failure log is source-scoped.**
+  PARTIALLY CLOSED 2026-11-17 sweep — the refusal was lifted in src/commands/sync.ts:4746-4753 (v0.42.42.0 #2139); the parallel-ack determinism test the TODO required was never written, so the box stays open until pinned.
   **Priority:** P3
   v0.42.32.0 (#1939) landed the source-scoping infrastructure this TODO asked
   for: `src/core/sync-failure-ledger.ts` keys every row by `(source_id, path)`,
@@ -2445,7 +2474,8 @@ contributor traps.
   vary too much). Estimate: ~2 weeks. Filed during v0.40.1.0 Track D
   /plan-eng-review (see `~/.claude/plans/system-instruction-you-are-working-whimsical-acorn.md`).
 
-- [ ] **v0.41+: Wire the nightly quality probe into autopilot scheduling.**
+- [x] **v0.41+: Wire the nightly quality probe into autopilot scheduling.**
+  CLOSED 2026-11-17 sweep — duplicate of the nightly-probe TODO above: autopilot.ts:1134-1180 invokes runNightlyQualityProbe on the 24h cadence honoring autopilot.nightly_quality_probe.enabled.
   v0.40.1.0 Track D shipped the phase (`src/core/cycle/nightly-quality-probe.ts`),
   the audit JSONL (`src/core/audit-quality-probe.ts`), the doctor check
   (`nightly_quality_probe_health` in doctor.ts), and the 10-question
@@ -2470,7 +2500,8 @@ contributor traps.
 
 ## v0.41+ master flake follow-ups (filed during v0.40.8.0 ship)
 
-- [ ] **(P3) — Audit other gateway-mutating tests for missing afterAll cleanup.** v0.40.8.0 added `afterAll(() => resetGateway())` to `test/ai/gateway.test.ts` and quarantined `test/ai/header-transport.test.ts` as `.serial.test.ts`. Two other files mutate gateway state without an explicit cleanup hook: `test/ai/rerank.test.ts`, `test/gateway-embed-model-override.test.ts`. They haven't surfaced flakes yet (different test sequences), but they're the same risk class. Add `afterAll(() => resetGateway())` to both for defense-in-depth, or quarantine if they prove racy under future parallelism changes.
+- [x] **(P3) — Audit other gateway-mutating tests for missing afterAll cleanup.** v0.40.8.0 added `afterAll(() => resetGateway())` to `test/ai/gateway.test.ts` and quarantined `test/ai/header-transport.test.ts` as `.serial.test.ts`. Two other files mutate gateway state without an explicit cleanup hook: `test/ai/rerank.test.ts`, `test/gateway-embed-model-override.test.ts`. They haven't surfaced flakes yet (different test sequences), but they're the same risk class. Add `afterAll(() => resetGateway())` to both for defense-in-depth, or quarantine if they prove racy under future parallelism changes.
+  CLOSED 2026-11-17 sweep — rerank.test.ts:48-51 has afterEach(resetGateway); gateway-embed-model-override.test.ts:50-58 has before+afterEach resetGateway. Leak class closed (afterEach rather than the literal afterAll).
 ## v0.40.4 adversarial review LOW findings — captured for v0.41+
 
 - [ ] **Codex L1**: `gbrain search stats --days N` underreports for N > 7. audit-writer.ts reads only current + previous ISO week (~14 days). `--days 30` silently shows ~2 weeks of failure events. Fix shape: extend readRecent to walk N/7 weeks dynamically OR cap user input with a clear message.
@@ -2480,14 +2511,16 @@ contributor traps.
 - [ ] **Claude F6**: ANSI / control-char injection via slug or path into stderr + --explain output. audit-slug-fallback writes user-derived `sourcePath`/`slug` unfiltered. explain-formatter renders `graph_session_prefix` (slug-derived) unfiltered. Slug validation in import-file may strip these but defense-in-depth at log/render sites is missing.
 - [ ] **Claude F7**: JSONL concurrent-append byte interleaving on large events. `appendFileSync` is atomic only when write size ≤ PIPE_BUF (~4096 bytes Linux). Supervisor audit rows can exceed this. Corrupt rows silently dropped via JSON.parse-in-catch. Fix shape: write to staging file + rename, or use fcntl advisory lock around append.
 - [ ] **Claude F8**: Audit files never pruned. 6 audit types × 52 weeks/year = 312+ files. Long-running installs accumulate disk/inode pressure. Add `cleanupOldFiles(retentionDays)` to audit-writer and wire into doctor's purge phase OR autopilot weekly maintenance.
-- [ ] **Claude F11**: Source-scope contract on getAdjacencyBoosts is JSDoc-only, no runtime check. Defensive `deleted_at IS NULL` was codified post-review; same defense pattern should apply to source-scope (the v0.34.1 source-isolation seal class). Add optional `sourceId` param that asserts at runtime, OR add a test-only contract checker.
+- [x] **Claude F11**: Source-scope contract on getAdjacencyBoosts is JSDoc-only, no runtime check. Defensive `deleted_at IS NULL` was codified post-review; same defense pattern should apply to source-scope (the v0.34.1 source-isolation seal class). Add optional `sourceId` param that asserts at runtime, OR add a test-only contract checker.
+  CLOSED 2026-11-17 sweep — test/e2e/graph-signals-engine.test.ts carries getAdjacencyBoosts contract + JSDoc-contract suites (the test-only contract checker branch).
 - [ ] **Claude F12**: `require('./core/search/explain-formatter.ts')` in cli.ts:576 is CommonJS. Repo is ESM. Switch to `await import(...)` for consistency with the file's other lazy-imports.
 - [ ] **Claude F14**: Telemetry undercounts on cache hit. onScoreDistribution and onGraphMeta fire ONLY in runPostFusionStages which runs ONLY in bare hybridSearch (not cache hit). Doctor's graph_signals_coverage decisions based on absent fire data on high-cache-hit installs.
 - [ ] **Claude F16**: src/core/skillpack/audit.ts carries duplicate ISO-week filename math. Refactor onto createAuditWriter for parity with the 5 audits unified in v0.40.4 T2.
 
 ## Pre-existing flake on master (noticed during v0.40.4 ship)
 
-- [ ] **`test/search/embedding-column.test.ts:466,489,522` — `isCacheSafe` returns false when run after gateway-state-mutating siblings in shard 2.** Confirmed pre-existing on master (`git stash` + `SHARD=2/8 bash scripts/run-unit-shard.sh` reproduces 3 fails on a clean working tree). Symptom: `isCacheSafe(default-named-column, empty-cfg)` expects `gwDims=1536` but reads `1280` (the post-v0.37.11.0 ZeroEntropy default). Some test in the shard before embedding-column.test.ts initializes the gateway with the PGLite-default ZeroEntropy/1280 config and leaves it that way. Either: (a) embedding-column.test.ts grows a `beforeEach` that calls `__setEmbedTransportForTests`-style reset, (b) the offending sibling adds an `afterAll(reset)`, or (c) embedding-column.test.ts becomes `*.serial.test.ts` to quarantine. Three test files in shard 2 touch gateway state via PGLite engine connects: `restart-sweep.test.ts`, `init-mode-picker.test.ts`, `doctor.test.ts`. Tests pass in isolation (50/50); only fail under shard-2 ordering. v0.40.4 ships through this flake — not introduced by the wave.
+- [x] **`test/search/embedding-column.test.ts:466,489,522` — `isCacheSafe` returns false when run after gateway-state-mutating siblings in shard 2.** Confirmed pre-existing on master (`git stash` + `SHARD=2/8 bash scripts/run-unit-shard.sh` reproduces 3 fails on a clean working tree). Symptom: `isCacheSafe(default-named-column, empty-cfg)` expects `gwDims=1536` but reads `1280` (the post-v0.37.11.0 ZeroEntropy default). Some test in the shard before embedding-column.test.ts initializes the gateway with the PGLite-default ZeroEntropy/1280 config and leaves it that way. Either: (a) embedding-column.test.ts grows a `beforeEach` that calls `__setEmbedTransportForTests`-style reset, (b) the offending sibling adds an `afterAll(reset)`, or (c) embedding-column.test.ts becomes `*.serial.test.ts` to quarantine. Three test files in shard 2 touch gateway state via PGLite engine connects: `restart-sweep.test.ts`, `init-mode-picker.test.ts`, `doctor.test.ts`. Tests pass in isolation (50/50); only fail under shard-2 ordering. v0.40.4 ships through this flake — not introduced by the wave.
+  CLOSED 2026-11-17 sweep — option (c): the file was quarantined as test/search/embedding-column.serial.test.ts; the non-serial path is gone.
 
 ## v0.40.4 graph signals — deferred follow-ups (v0.41+)
 
@@ -2566,7 +2599,8 @@ contributor traps.
 
 ## v0.37.7.0 federated-brains + autopilot safety follow-ups (v0.37.x+)
 
-- [ ] **.sql file indexing (#1173) — dropped from v0.37.7.0 because tree-sitter-sql.wasm is not in `src/assets/wasm/grammars/`.** The grammars directory ships 35 languages but SQL is not among them. Plan deliberately verify-first-gated this (codex CF11). Re-file as a dedicated wave that: (a) ships tree-sitter-sql.wasm (vendor from upstream), (b) extends the sync walker's `.md|.markdown|.txt` extension filter to include `.sql`, (c) routes `.sql` through `importCodeFile()` with `page_kind='code'`, (d) addresses the slug-shape collision codex flagged with #1172's punted "flatten extensions" work — `slugifyCodePath('docs/auth.sql')` produces a slug shape that may collide with `docs/auth.md` if #1172 ever ships. Verify-first the slug round-trip before merging.
+- [x] **.sql file indexing (#1173) — dropped from v0.37.7.0 because tree-sitter-sql.wasm is not in `src/assets/wasm/grammars/`.** The grammars directory ships 35 languages but SQL is not among them. Plan deliberately verify-first-gated this (codex CF11). Re-file as a dedicated wave that: (a) ships tree-sitter-sql.wasm (vendor from upstream), (b) extends the sync walker's `.md|.markdown|.txt` extension filter to include `.sql`, (c) routes `.sql` through `importCodeFile()` with `page_kind='code'`, (d) addresses the slug-shape collision codex flagged with #1172's punted "flatten extensions" work — `slugifyCodePath('docs/auth.sql')` produces a slug shape that may collide with `docs/auth.md` if #1172 ever ships. Verify-first the slug round-trip before merging.
+  CLOSED 2026-11-17 sweep — tree-sitter-sql.wasm vendored (src/assets/wasm/grammars/), src/core/chunkers/code.ts:83 imports it, '.sql' in CODE_EXTENSIONS (src/core/sync.ts:93), import-file.ts:1046/1271 routes page_kind='code'.
 
 - [ ] **#1204 deeper investigation — `gbrain extract all` reports 0 links on federated brains with cross-source duplicate slugs.** v0.37.7.0 added `--source-id <id>` to scope extraction explicitly, which gives users a workaround. But the underlying "silent 0 links" bug on unscoped federated extracts has additional facets: the resolver path in `extractLinksFromDB` builds `slugToSources` from `listAllPageRefs`, then iterates `allRefs` and resolves wikilinks. For a slug that exists in 2+ sources, the resolver may pick the wrong target. Run `/investigate` against a fixture with 2 sources × overlapping slugs × cross-source wikilinks, characterize the failure mode, file a precise fix.
 
@@ -2580,7 +2614,8 @@ contributor traps.
 
 - [ ] **v0.37.x: Adopt `resolveDefaultHeaders` for Together / Groq / other attribution-bearing recipes.** v0.37.6.0's `default_headers` / `resolveDefaultHeaders` seam is generic — any recipe whose provider benefits from app-attribution headers can opt in. Together and Groq both have rankings/analytics tied to per-app headers. Add their respective attribution headers to each recipe, similar to OR's `HTTP-Referer` + `X-OpenRouter-Title`. No type-system or gateway changes needed; just `default_headers` blocks on the existing recipes plus `<PROVIDER>_REFERER` / `<PROVIDER>_TITLE` env vars in their `auth_env.optional`. Filed during v0.37.6.0 eng review as a D4 generalization opportunity.
 
-- [ ] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
+- [x] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
+  CLOSED 2026-11-17 sweep — src/cli.ts:2643 wraps main() in if (import.meta.main).
 
 
 ## v0.37.4.0 pgGraph CI scaffolding follow-ups (v0.37.x+)
@@ -2671,13 +2706,16 @@ contributor traps.
 
 ## embed --stale follow-ups (v0.34.4.0)
 
-- [ ] **v0.35.x: Concurrent NULL→non-NULL upsert race in `embed.ts:429-443` + `postgres-engine.ts:1231`'s `COALESCE(EXCLUDED.embedding, content_chunks.embedding)`.** Two `embed --stale` workers (or `embed --stale` racing with a sync that re-embeds the same chunk) can have the slower writer overwrite the faster one's fresher embedding. Window is small (20 workers, all from the same `listStaleChunks` snapshot) but exists. Tractable fix: a `WHERE content_chunks.embedded_at < EXCLUDED.embedded_at OR content_chunks.embedding IS NULL` predicate on the upsert. Out of scope for v0.34.4.0 because the upsert is not in the diff; pre-existing bug. Filed during v0.34.4.0 codex outside-voice review.
+- [x] **v0.35.x: Concurrent NULL→non-NULL upsert race in `embed.ts:429-443` + `postgres-engine.ts:1231`'s `COALESCE(EXCLUDED.embedding, content_chunks.embedding)`.** Two `embed --stale` workers (or `embed --stale` racing with a sync that re-embeds the same chunk) can have the slower writer overwrite the faster one's fresher embedding. Window is small (20 workers, all from the same `listStaleChunks` snapshot) but exists. Tractable fix: a `WHERE content_chunks.embedded_at < EXCLUDED.embedded_at OR content_chunks.embedding IS NULL` predicate on the upsert. Out of scope for v0.34.4.0 because the upsert is not in the diff; pre-existing bug. Filed during v0.34.4.0 codex outside-voice review.
+  CLOSED 2026-11-17 sweep — both engines gate the upsert on embedded_at comparison (postgres-engine.ts:2560-2590, pglite-engine.ts:2425+); pinned by test/e2e/concurrent-embed-race.test.ts + src/core/embed-backfill-lock.ts single-flight.
 
-- [ ] **v0.35.x: New stale rows inserted behind the keyset cursor.** A sync or `gbrain put_page` mid-`embed --stale` creates chunks with `embedding IS NULL` at `(page_id, chunk_index)` already passed by the cursor. Picked up on next run via the partial index; documented limitation. Possible fix: a second pass at end-of-run that does a fresh `countStaleChunks()` and re-enters the loop while count > 0 and budget allows. Filed during v0.34.4.0 codex outside-voice review.
+- [x] **v0.35.x: New stale rows inserted behind the keyset cursor.** A sync or `gbrain put_page` mid-`embed --stale` creates chunks with `embedding IS NULL` at `(page_id, chunk_index)` already passed by the cursor. Picked up on next run via the partial index; documented limitation. Possible fix: a second pass at end-of-run that does a fresh `countStaleChunks()` and re-enters the loop while count > 0 and budget allows. Filed during v0.34.4.0 codex outside-voice review.
+  CLOSED 2026-11-17 sweep — src/commands/embed.ts:1045-1075 bounded end-of-run keyset re-entry (MAX_REENTRIES=3 + forward-progress guard).
 
 ## MCP fix wave follow-ups (v0.34.1)
 
-- [ ] **v0.34.x: Source-scope `takes_*` ops (pre-existing leak surfaced during v0.34.1 adversarial review).** `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration` in `src/core/operations.ts:1248-1335` thread `ctx.takesHoldersAllowList` but never `ctx.sourceId`. An auth'd OAuth client scoped to `source_id='canon-a'` can call `takes_list --page_slug=foo` (slug in `canon-b`) and read takes attached to foreign-source pages. Pre-existing, not introduced by v0.34.1, but the wave was framed as "P0 source-isolation seal on the read path" and `takes_*` surfaces were missed. Fix: extend `TakesListOpts` in `src/core/engine.ts:186` with `sourceId?: string` + `sourceIds?: string[]`; thread `sourceScopeOpts(ctx)` at each op handler; engine `listTakes`/`searchTakes` filter via the `pages` JOIN.
+- [x] **v0.34.x: Source-scope `takes_*` ops (pre-existing leak surfaced during v0.34.1 adversarial review).** `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration` in `src/core/operations.ts:1248-1335` thread `ctx.takesHoldersAllowList` but never `ctx.sourceId`. An auth'd OAuth client scoped to `source_id='canon-a'` can call `takes_list --page_slug=foo` (slug in `canon-b`) and read takes attached to foreign-source pages. Pre-existing, not introduced by v0.34.1, but the wave was framed as "P0 source-isolation seal on the read path" and `takes_*` surfaces were missed. Fix: extend `TakesListOpts` in `src/core/engine.ts:186` with `sourceId?: string` + `sourceIds?: string[]`; thread `sourceScopeOpts(ctx)` at each op handler; engine `listTakes`/`searchTakes` filter via the `pages` JOIN.
+  CLOSED 2026-11-17 sweep — TakesListOpts carries sourceId/sourceIds (engine.ts:298-314); all four takes_* handlers spread sourceScopeOpts(ctx) (operations.ts ~1925-2008); engines filter via the pages JOIN.
 
 - [ ] **v0.34.x: Extend `sourceScopeOpts(ctx)` to the 14 read-side ops PR #861 didn't touch.** `get_page`, `get_tags`, `get_links`, `get_backlinks`, `get_timeline`, `list_files`, `get_file`, and the four `takes_*` ops (above) still use the v0.31.8-era `const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {}` pattern. NOT a leak (scalar `ctx.sourceId` IS threaded), but federated_read (#876, `ctx.auth?.allowedSources`) is silently dropped. A "WeCare L3 dept" client gets correct federated results from `search`/`query`/`list_pages`/`traverse_graph`/`find_experts` but only sees its scalar `source_id` for `get_page`/`get_tags`/etc. Fix: route all 14 sites through `sourceScopeOpts(ctx)`.
 
@@ -2712,7 +2750,8 @@ contributor traps.
 
 - [ ] **v0.33.x: Adversarial-intent fixtures.** Intents specifically designed to test dispatcher-vs-subskill behavior on edge cases ("I want to do something brain-related" without specifying what). Targets the prompt-design failure mode (run-1 collapse) that our current 25 fixtures don't surface. ~10-15 fixtures, authored without looking at variant content.
 
-- [ ] **v0.33.x: Run-2 vs Run-1 prompt-design ablation.** Document the difference between the naive classifier prompt (run-1, every variant 30-60% training) and the dispatcher-aware prompt (run-2+, functional-areas 88-100% training) as a reproducible result. This is the strongest empirical finding from v0.32.3.0 and deserves its own callout in SKILL.md or a sibling METHODOLOGY.md.
+- [x] **v0.33.x: Run-2 vs Run-1 prompt-design ablation.** Document the difference between the naive classifier prompt (run-1, every variant 30-60% training) and the dispatcher-aware prompt (run-2+, functional-areas 88-100% training) as a reproducible result. This is the strongest empirical finding from v0.32.3.0 and deserves its own callout in SKILL.md or a sibling METHODOLOGY.md.
+  CLOSED 2026-11-17 sweep — documented in skills/functional-area-resolver/SKILL.md:139 + evals/functional-area-resolver/README.md:125-137 with reproducible receipts in baseline-runs/.
 
 ## Embedding-provider follow-ups (v0.32.0)
 
@@ -3094,6 +3133,7 @@ verify Voyage adapter integration in `src/core/ai/recipes/voyage.ts`).
 **Depends on:** None.
 
 ### `gbrain config unset <key>` subcommand (Codex F6 from PR #719 review)
+**CLOSED 2026-11-17 sweep — src/commands/config.ts:55-87 implements the unset action (engine.unsetConfig) incl. --pattern bulk delete (v0.32.3 [CDX-7+8]).**
 **Priority:** P3
 
 **What:** Add `unset` action alongside `show|get|set` in `src/commands/config.ts`. Calls `engine.setConfig(key, '')` (loadConfigWithEngine treats empty string as undefined) so a user who set a key by mistake can clear it. Empty-string write is the minimum-diff implementation; a real DELETE would be cleaner if the engine grows one.
@@ -3170,6 +3210,7 @@ verify Voyage adapter integration in `src/core/ai/recipes/voyage.ts`).
 **Depends on:** AbortController plumbing in BrainEngine interface.
 
 ### Replace `/health` with a lighter liveness probe
+**CLOSED 2026-11-17 sweep — /health is liveness-only (probeLiveness, serve-http.ts:1067); the heavy getStats probe moved off /health in v0.28.10.**
 **Priority:** P3
 
 **What:** `engine.getStats()` does `count(*) FROM pages, content_chunks, links, tags, timeline_entries` plus `GROUP BY type`. On a large but otherwise healthy brain, this can normally exceed 3s and cause false-positive 503s + orchestrator restart loops.
@@ -3194,6 +3235,7 @@ verify Voyage adapter integration in `src/core/ai/recipes/voyage.ts`).
 **Depends on:** Nothing.
 
 ### Migration introspection in `get_health`
+**CLOSED 2026-11-17 sweep — BrainHealth.migrations (types.ts:1507, v0.30.1) exposes migration introspection to MCP get_health callers without SSH + gbrain doctor.**
 **Priority:** P3
 
 **What:** Extend `BrainEngine.getHealth()` return shape with `migrations: { pending: [...], wedged: [...] }`. `gbrain doctor` already shows this; expose it via the MCP op so remote agents can detect partial-migration state without invoking `doctor` separately.
@@ -3254,6 +3296,7 @@ verify Voyage adapter integration in `src/core/ai/recipes/voyage.ts`).
 **Depends on:** Nothing.
 
 ### `sources.chunker_version` PGLite-schema parity
+**CLOSED 2026-11-17 sweep — migration adds sources.chunker_version for both engines (migrate.ts:1087-1089); it's in the PGLite bootstrap probe set (test/schema-bootstrap-coverage.test.ts:714); engines write it on insert.**
 **Priority:** P3
 
 **What:** `src/schema.sql:33` declares `sources.chunker_version` and `src/commands/sync.ts:253` reads/writes it, but `src/core/pglite-schema.ts:28` omits the column. PGLite users hit a schema-mismatch error on the sync write path.
@@ -3268,6 +3311,7 @@ verify Voyage adapter integration in `src/core/ai/recipes/voyage.ts`).
 ## OAuth/MCP hardening (v0.26.7 follow-up)
 
 ### F11 — `auth register-client --redirect-uri` flag
+**CLOSED 2026-11-17 sweep — repeatable --redirect-uri loop parser in src/commands/auth.ts:338,398-399,446 (v0.41.3).**
 **Priority:** P3
 
 **What:** `gbrain auth register-client` always passes `[]` for redirect URIs; there is no CLI flag to set them. Operators who want to register an `authorization_code` client without DCR have to hand-edit the database.
@@ -3439,6 +3483,7 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 ## ci-local-mirror
 
 ### CI-skip artifact + signature for stages 1+2 follow-up
+**PARTIALLY CLOSED 2026-11-17 sweep — the ci-pass-<hash> actions/cache skip landed (.github/workflows/test.yml:30-70); the GPG-signature half did NOT land and remains open.**
 **Priority:** P0
 
 **What:** After a successful local CI run via `bun run ci:local`, write `.ci-cache/passed-<commit-sha>.json` containing `{commit, test_set_hash, bun_version, schema_hash, signature}`. Push to a `ci-cache` orphan branch (or GH Releases). CI's first step fetches the artifact for the current SHA and skips the test job if (a) signature matches Garry's GPG/SSH key, and (b) `test_set_hash` matches what CI would have run.
@@ -3465,6 +3510,7 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 **Depends on / blocked by:** Stages 1+2 (this PR) landing first.
 
 ### test/e2e/multi-source.test.ts cascade test isn't isolated
+**CLOSED 2026-11-17 sweep — beforeEach now deletes non-default sources, wipes file_migration_ledger and resets the default source.**
 **Priority:** P1
 
 **What:** The "sources remove cascades to pages + chunks + timeline + links + files" test in `test/e2e/multi-source.test.ts:281` fails when the file runs after other E2E files in the sequential `bash scripts/run-e2e.sh` order, but passes 20/20 on a fresh Postgres volume. The failing assertion is `SELECT COUNT(*) FROM links WHERE from_page_id = aliceId` expecting 0, getting 1 — so a prior file's setup left a `links` row that references a page id the cascade test happens to reuse. The test's own `setupDB()` truncates but doesn't sweep all referencing rows back when ids collide.
@@ -3610,6 +3656,7 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 ## minions / worker (v0.22.14 follow-ups)
 
 ### v0.22.15 — Embed cooperative-abort (HIGHEST PRIORITY — daily pain)
+**CLOSED 2026-11-17 sweep — AbortSignal threads through src/commands/embed.ts:95-102 ('#1737 cooperative-abort') + src/core/embedding.ts; test/abort-check.test.ts pins it.**
 **Priority:** P0
 
 **What:** Plumb `signal: AbortSignal` through `runPhaseEmbed` →
@@ -3662,6 +3709,7 @@ duplicative.
 **Depends on / blocked by:** Nothing. v0.22.14 ships first.
 
 ### v0.23+ — Bare-worker engine reconnect parity with supervisor
+**CLOSED 2026-11-17 sweep — src/core/minions/worker.ts:671-678 reconnectAfterConnectionError, invoked at the claim site (:545).**
 **Priority:** P2
 
 **What:** Extract the supervisor's reconnect-then-fail pattern into
@@ -3807,6 +3855,7 @@ call sites — and it's the correct architectural endpoint.
 **Depends on / blocked by:** Nothing.
 
 ### CHANGELOG migration note for `acknowledgeSyncFailures()` shape change
+**CLOSED 2026-11-17 sweep — the required 'For contributors' block is present (CHANGELOG.md:19101).**
 **Priority:** P0 — required at /ship time
 
 **What:** When PR #501 ships, the release CHANGELOG entry MUST include this
@@ -3829,6 +3878,7 @@ that imported it got `number` and now get an object — silent type break.
 **Depends on / blocked by:** PR #501 ship.
 
 ### Concurrent-safe ack of `~/.gbrain/sync-failures.jsonl`
+**CLOSED 2026-11-17 sweep — src/core/sync-failure-ledger.ts withLedgerLock() (.lock file) + rename-based atomic replace; acknowledgeFailures() returns {count, summary}.**
 **Priority:** P3
 
 **What:** Two concurrent `gbrain sync` runs hitting `acknowledgeSyncFailures()`
@@ -4074,6 +4124,7 @@ mentions 100%, attended 100%. works_at 58% and advises 41% are next
 iteration's residuals.
 
 ### v0.10.4: gbrain alias resolution feature (driven by Cat 3)
+**CLOSED 2026-11-17 sweep — alias tables + resolveAliases (pglite-schema.ts:1066/1086, migrate.ts:4853/5044, engine.ts:2008); search blends alias matches into hybrid scoring (src/core/search/hybrid.ts:607-713).**
 **What:** Add an alias table to gbrain so "Sarah Chen" / "S. Chen" / "@schen" / "sarah.chen@example.com" resolve to one canonical entity. Schema: `aliases (id, slug, alias_text)` with a unique index. Search blends alias matches into hybrid scoring.
 
 **Why:** BrainBench Cat 3 measured 31% recall on undocumented aliases — that's the v0.10.x baseline. With alias table, should jump to 80%+.
@@ -4137,6 +4188,7 @@ iteration's residuals.
 ## P0
 
 ### PGLite test-runner concurrency flake (~27 false failures in full `bun test`)
+**CLOSED 2026-11-17 sweep — full bun test now runs through the sharded parallel runner (package.json:41 run-unit-parallel.sh); test/cathedral-ii-pglite.test.ts no longer exists.**
 **What:** Fix the concurrent-PGLite-init flake that surfaces ~27 `error: PGLite not connected. Call connect() first.` failures when `bun test` runs all 174 unit-test files together. Each failing file passes in isolation; failures only appear under full-suite parallelism.
 
 **Why:** The failures are masking real signal. /ship and any solo dev running `bun test` has to manually triage 27 results every time. Today they're all in `test/cathedral-ii-pglite.test.ts`, `test/cathedral-ii-brainbench.test.ts` (Layer 5/6/7/8 + parent_scope_coverage + call_graph_recall), `test/sync.test.ts` (4 dry-run cases), `test/reindex-code.test.ts` (Layer 13 E2). All exist on master and date back to v0.12.3-v0.21.0 — pre-existing, not caused by any one branch.
@@ -4180,6 +4232,7 @@ iteration's residuals.
 ## P1 (new from v0.25.0 — eval-capture adversarial review)
 
 ### v0.25.0 eval-capture follow-ups (6 surgical hardenings)
+**2026-11-17 sweep — sub-items 2 (scrubber_exception classification) and 3 (Luhn credit-card scrub) landed (src/core/eval-capture.ts:135-146,177-190; docs/eval-capture.md:76). Sub-items 1 (countEvalCandidatesBefore), 4 (source_id column), 5 (export command) and 6 (retention policy) remain open.**
 **Priority:** P1
 
 **What:** Six targeted hardenings on the v0.25.0 eval-capture surface, all surfaced by the /ship adversarial review and triaged out of the v0.25.0 PR to keep scope tight:
@@ -4205,6 +4258,7 @@ iteration's residuals.
 ## P1 (new from v0.18.0 — test flakiness)
 
 ### beforeAll hook timeouts under parallel test runner
+**CLOSED 2026-11-17 sweep — bunfig.toml sets [test] timeout = 60_000 (v0.26.4).**
 **What:** 17 tests across 9 files (dream, orphans, brain-allowlist, extract-db, multi-source-integration, core/cycle, migrations-v0_12_2, migrations-v0_13_1, oauth) fail with `beforeEach/afterEach hook timed out for this test` at the 7-10 second threshold when run via `bun run test` (parallel). Every test passes in isolation (`bun test path/to/file.test.ts` → 0 fail). Root cause is PGLite schema init racing under concurrent test files.
 
 **Why:** `bun run test` is the pre-ship gate and reports these as failures, forcing manual triage on every /ship. The tests themselves are correct — the runner is stressing PGLite boot. Bumping the hook timeout or running E2E-like tests with `--bail` or serial execution would clear the 18 false positives.
@@ -4275,6 +4329,7 @@ iteration's residuals.
 **Depends on:** v0.18.2 shipped. ✅
 
 ### 22K-page resync is 30+ minutes on large brains (deferred from v0.18.2 codex review)
+**CLOSED 2026-11-17 sweep — sync.ts:786,4563,4654 fan out via pMapAllSettled with per-worker engines.**
 
 **What:** When a schema migration requires data backfill (e.g., computing `page_id` from `page_slug` across all `files` rows), `src/commands/sync.ts:248-251, 311-337` iterates per-file. None of v0.18.2's hardening work shrinks this path. On a 22K-page brain the resync takes 30+ minutes; at 500K pages it would be several hours.
 
@@ -4290,6 +4345,7 @@ iteration's residuals.
 **Depends on:** v0.18.2 shipped. ✅
 
 ### Minions: `gbrain jobs stats --orphaned` (deferred from v0.13.0)
+**CLOSED 2026-11-17 sweep — doctor.ts:1811 flags waiting jobs whose queue has no live registered worker, with the jobs work/supervisor fix command.**
 
 **What:** New CLI flag / output column surfacing jobs that are waiting with no registered handler on any live worker.
 
@@ -4334,6 +4390,7 @@ iteration's residuals.
 **Depends on:** First shell-job author who actually needs it. Don't pre-build the flag.
 
 ### Security hardening follow-ups (deferred from security-wave-3)
+**2026-11-17 sweep — DNS-rebinding, IPv6 ULA/link-local, traverse depth cap, search-limit clamp and sync_brain localOnly landed (ssrf-validate.ts:174-175, url-safety.ts:100-105, operations.ts:2274/1542/2747). 6to4/Teredo, IPv4 shorthand parse, file_upload size cap + isFile check and upload_root confinement remain open.**
 **What:** Close remaining security gaps identified during the v0.9.4 Codex outside-voice review that didn't make the wave's in-scope cut.
 
 **Why:** Wave 3 closed 5 blockers + 4 mediums. These are the known residuals. Each is an independent hardening item that becomes trivial as Runtime MCP access control (P0 above) lands.
@@ -4381,6 +4438,7 @@ iteration's residuals.
 **Depends on:** v0.7.0 recipe format (shipped).
 
 ### `gbrain serve --http` + Fly.io/Railway deployment
+**CLOSED 2026-11-17 sweep — gbrain serve --http ships (src/cli.ts:2612, src/mcp/http-transport.ts). The Fly.io/Railway recipe half did not land; tracked separately below.**
 **What:** Add `gbrain serve --http` as a thin HTTP wrapper around the stdio MCP server. Include a Dockerfile/fly.toml for cloud deployment.
 
 **Why:** The Edge Function deployment was removed in v0.8.0. Remote MCP now requires a custom HTTP wrapper around `gbrain serve`. A built-in `--http` flag would make this zero-effort. Bun runs natively, no bundling seam, no 60s timeout, no cold start.
@@ -4426,6 +4484,7 @@ iteration's residuals.
 **Depends on:** Nothing.
 
 ### Doctor --fix polish from v0.14.1 adversarial review
+**2026-11-17 sweep — sub-item 3 (expandBullet walk-up context) landed (src/core/dry-fix.ts:148-175). Code-fence edge cases, working-tree cache and ambiguous-match handling remain open (dry-fix.ts:493 still skips ambiguous_multiple_matches).**
 **What:** Six deferred findings from v0.14.1 ship-time adversarial review on `src/core/dry-fix.ts`:
 1. **TOCTOU between read and write.** `attemptFix` reads once, writes later. Concurrent editor saves silently overwritten. Fix: re-read immediately before write and compare snapshot, or `O_EXCL` tempfile + rename.
 2. **Fence detection misses 4-backtick and `~~~` fences.** `isInsideCodeFence` only catches `^```$`. CommonMark-legal alternates slip through.
@@ -4457,6 +4516,8 @@ iteration's residuals.
 ### Caller-opt-in retry for `executeRaw` (D3 follow-up from v0.22.1)
 **What:** Add `PostgresEngine.executeRawIdempotent(sql, params)` (or a `{retry: true}` parameter flag on `executeRaw`) so callers explicitly opt into auto-retry for statements they know are idempotent. Audit existing call sites and migrate the read-only ones (search, page fetches, etc.) to the new method.
 
+**2026-11-17 sweep — misfiled under Completed:** this work is NOT in the codebase (no `executeRawIdempotent` in either engine, no `{retry}` flag on `executeRaw`). Restoring to the open backlog.
+
 **Why:** Closes the gap left by D3's drop-the-wrapper decision in v0.22.1. The original #406 wrapped `executeRaw` in a regex-gated retry that was unsound for writable CTEs and side-effecting SELECTs. Recovery moved up to the supervisor watchdog, but per-call recovery for reads (the bulk of `executeRaw` traffic from MCP, search, page fetches) is gone. A caller-opt-in flag puts the idempotency decision where it belongs (at the call site, with full statement context).
 
 **Pros:** Restores per-call auto-recovery for reads without the phantom-write risk on mutations. Explicit > clever: each call site declares its own idempotency posture. Future caller-added mutations get safe-by-default behavior.
@@ -4473,6 +4534,8 @@ iteration's residuals.
 ### Replace `walkMarkdownFiles` with `engine.getAllSlugs()` in `extractForSlugs` (F1 follow-up from v0.22.1)
 **What:** The cycle path's `extractForSlugs()` at `src/commands/extract.ts:455` still does a `walkMarkdownFiles(brainDir)` to build the `allSlugs` set for link resolution. On a 54K-page brain that's a single `readdir` traversal (~hundreds of ms — acceptable, dominated by the file-content-read elimination from #417). But `engine.getAllSlugs()` exists at `extract.ts:728` and produces the same set via a single SQL query (~tens of ms).
 
+**2026-11-17 sweep — misfiled under Completed:** `extractForSlugs` still walks the filesystem here; the swap was never made. Restoring to the open backlog.
+
 **Why:** Eliminates the residual directory walk on every cycle. Codex F1 noted that the v0.22.1 plan's "cycle never re-walks the whole tree again" claim was overstated — it stops READING file contents but still walks the directory. This TODO closes that gap honestly.
 
 **Pros:** Cycle becomes O(slugs sync touched), not O(total brain size). No more readdir on a growing brain. ~5 LOC change.
@@ -4487,6 +4550,8 @@ iteration's residuals.
 
 ### `err.code`-based connection-error matching in `postgres-engine.ts` (B1 follow-up from v0.22.1)
 **What:** The CONNECTION_ERROR_PATTERNS array (~12 strings: `ECONNREFUSED`, `connection terminated`, `password authentication failed`, etc.) matched against `err.message` and `err.code`. Replace with structured matching against `err.code` only, using postgres.js's typed error classes (`PostgresError` with structured codes).
+
+**2026-11-17 sweep — misfiled under Completed:** `CONNECTION_ERROR_PATTERNS` still matches by message substring; the typed-code rewrite never landed. Restoring to the open backlog.
 
 **Why:** String matching against error messages breaks on library upgrades (postgres.js could change its error message phrasing without bumping major). Code matching is durable. The Layer 1 cleanup follows: gbrain itself doesn't define connection-error codes; it should defer to postgres.js's classification.
 
@@ -4727,6 +4792,7 @@ atomic-rename concurrency contract. The interface is implicit in the test
 fixtures today.
 
 ### CLAUDE.md "Key files" annotations (DOC2)
+**CLOSED 2026-11-17 sweep — both files carry full KEY_FILES.md entries (docs/architecture/KEY_FILES.md:23); the per-file index lives there per the reference-doc refactor.**
 
 **What:** Add one-line entries under CLAUDE.md's "Key files" section for
 `src/core/context-engine.ts` and `src/openclaw-context-engine.ts`. Per
