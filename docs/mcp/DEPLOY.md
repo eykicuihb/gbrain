@@ -5,8 +5,8 @@
 > dashboard at `/admin`, scoped operations, and a live SSE activity feed.
 > Pre-v0.26 legacy bearer tokens still work — `verifyAccessToken` falls back
 > to the `access_tokens` table and grandfathers tokens to `read+write+admin`.
-> Postgres-only for the legacy fallback (the `access_tokens` table is Postgres-only);
-> OAuth tables work on both PGLite and Postgres. See [SECURITY.md](../../SECURITY.md)
+> Works on both PGLite and Postgres (since v0.31.3, the auth SQL routes through
+> the engine adapter, not a postgres.js singleton). See [SECURITY.md](../../SECURITY.md)
 > for env vars and tunable defaults.
 
 Access your brain from any device, any AI client. GBrain ships two transports:
@@ -57,8 +57,8 @@ Your AI client (Claude Desktop, Perplexity, etc.)
 ```
 
 This requires:
-1. A Postgres-backed brain (the `access_tokens` table only exists on Postgres;
-   running `gbrain serve --http` against a PGLite install fails fast at startup)
+1. A brain — PGLite or Postgres both work (since v0.31.3, the HTTP transport's
+   auth SQL routes through the engine adapter; no postgres.js singleton required)
 2. A machine running `gbrain serve --http`
 3. A public tunnel (ngrok, Tailscale, or cloud host)
 4. A bearer token created via `gbrain auth create <name>`
@@ -182,10 +182,12 @@ router exposes the spec-compliant discovery endpoint at
 
 ### 4. Scopes and localOnly
 
-Every operation is tagged `read | write | admin`. Four operations are
+Every operation is tagged `read | write | admin`. Ten operations are
 `localOnly` and rejected over HTTP regardless of scope: `sync_brain`,
-`file_upload`, `file_list`, `file_url`. Remote agents cannot reach local
-filesystem surface area.
+`file_upload`, `file_list`, `file_url`, `purge_deleted_pages`,
+`get_recent_transcripts`, `code_traversal_cache_clear`, `migrate_embeddings`,
+`chronicle_backfill`, `extraction_review`. Remote agents cannot reach local
+filesystem surface area or destructive maintenance paths.
 
 | Scope | What it allows |
 |-------|---------------|
@@ -243,8 +245,10 @@ gbrain auth test \
 
 ## Operations
 
-All 30 GBrain operations are available remotely, including `sync_brain` and
-`file_upload` (no timeout limits with self-hosted server).
+All non-localOnly operations (96 of the 106 defined in
+[`src/core/operations.ts`](../../src/core/operations.ts)) are available remotely.
+The 10 excluded are filesystem-touching or maintenance paths — see the localOnly
+section above. Self-hosted servers impose no timeout limits on remote calls.
 
 **Security note on `file_upload`:** remote MCP callers are confined to the working
 directory where `gbrain serve` was launched. Symlinks, `..` traversal, and absolute

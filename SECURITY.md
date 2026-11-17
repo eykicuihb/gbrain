@@ -151,13 +151,17 @@ fires when `--public-url` is set without `--bind` so the operator sees
 the binding before the first request — common cause of "ngrok forwards
 to me but the agent can't reach the upstream" misconfigurations.
 
-### Postgres-only
+### Engine support (both PGLite and Postgres)
 
-`gbrain serve --http` requires a Postgres engine. PGLite is local-only by
-design and the `access_tokens` / `mcp_request_log` tables don't exist in
-the PGLite schema. Local agents continue to use stdio (`gbrain serve`).
-Running `--http` against a PGLite-backed install fails fast with a clear
-error message at startup.
+`gbrain serve --http` works against both engines. Since v0.31.3 the auth and
+audit SQL routes through the engine adapter rather than a postgres.js
+singleton, so the `access_tokens` / `mcp_request_log` tables are created and
+queried identically on PGLite and Postgres (shared migration v4). The same
+hardening — loopback bind default, scope enforcement, localOnly rejection,
+rate limiting — applies to both. Local agents continue to use stdio
+(`gbrain serve`); for anything exposed beyond loopback, prefer a
+Postgres-backed brain behind the Docker network isolation below, where the
+operational tooling (pooler, snapshots, access revocation) is strongest.
 
 ### Docker network isolation (self-hosted Postgres)
 

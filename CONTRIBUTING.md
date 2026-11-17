@@ -170,7 +170,7 @@ time** ... never add new entries. v0.26.8 (env sweep) and v0.26.9 (PGLite sweep
 ### Local CI gate (recommended before pushing, v0.23.1+)
 
 ```bash
-bun run ci:local         # full gate: gitleaks + unit + ALL 29 E2E files (sequential)
+bun run ci:local         # full gate: gitleaks + unit + ALL 164 E2E files (sequential)
 bun run ci:local:diff    # gate with diff-aware E2E selector
 bun run ci:select-e2e    # print which E2E files the selector would run
 ```
@@ -182,7 +182,7 @@ E2E after the first cold pull). Requires Docker (Docker Desktop, OrbStack, or
 Colima) and `gitleaks` on host (`brew install gitleaks`). Override the postgres
 host port with `GBRAIN_CI_PG_PORT=5435 bun run ci:local` if 5434 collides.
 
-Fail-closed selector: an unmapped `src/` change runs all 29 E2E files. Hand-tune
+Fail-closed selector: an unmapped `src/` change runs all 164 E2E files. Hand-tune
 narrower mappings via `scripts/e2e-test-map.ts`.
 
 ### PR-side security checks
