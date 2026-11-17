@@ -994,8 +994,10 @@ export interface BrainEngine {
    * lookup; without it, multi-source brains return chunks from every
    * same-slug source (importCodeFile uses this for incremental embedding
    * reuse, which would then attach the wrong source's embeddings).
+   * `opts.sourceIds` (federated grant, #2200-class) takes precedence over
+   * the scalar and scopes the page lookup to `ANY($::text[])`.
    */
-  getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]>;
   /**
    * Count chunks across the brain where embedding IS NULL.
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
@@ -1498,8 +1500,10 @@ export interface BrainEngine {
    * v0.31.8 (D21): `opts.sourceId` source-scopes the page-id lookup. Without
    * it, multi-source brains return raw_data rows from every same-slug page
    * (preserved via two-branch query for back-compat).
+   * `opts.sourceIds` (federated grant, #2200-class) takes precedence over
+   * the scalar and scopes the page lookup to `ANY($::text[])`.
    */
-  getRawData(slug: string, source?: string, opts?: { sourceId?: string }): Promise<RawData[]>;
+  getRawData(slug: string, source?: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<RawData[]>;
 
   // Files (v0.27.1: binary asset metadata + storage_path. Image bytes never
   // enter the DB; storage_path references a path inside the brain repo or an
@@ -1924,8 +1928,10 @@ export interface BrainEngine {
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the page-id lookup.
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
+   * `opts.sourceIds` (federated grant, #2200-class) takes precedence over
+   * the scalar and scopes the page lookup to `ANY($::text[])`.
    */
-  getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]>;
+  getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the

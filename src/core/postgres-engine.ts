@@ -2599,7 +2599,20 @@ export class PostgresEngine implements BrainEngine {
     );
   }
 
-  async getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]> {
+  async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]> {
+    // #2200-class: a federated grant scopes the page lookup to ANY($::text[]).
+    // Takes precedence over the scalar; without either, falls back to 'default'
+    // (the long-standing behavior for trusted internal callers like embed-stale).
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      const ids = opts.sourceIds;
+      const rows = await this.sql`
+        SELECT cc.* FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = ${slug} AND p.source_id = ANY(${ids}::text[])
+        ORDER BY cc.chunk_index
+      `;
+      return rows.map((r: Record<string, unknown>) => rowToChunk(r));
+    }
     const sourceId = opts?.sourceId ?? 'default';
     // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING).
     return await this.withScopedReadTransaction(undefined, sourceId, async (tx) => {
@@ -4170,15 +4183,25 @@ export class PostgresEngine implements BrainEngine {
   async getRawData(
     slug: string,
     source?: string,
-    opts?: { sourceId?: string },
+    opts?: { sourceId?: string; sourceIds?: string[] },
   ): Promise<RawData[]> {
     const sql = this.sql;
     // v0.31.8 (D21): four-branch shape on (source provided, sourceId provided).
     // Postgres.js template-literal style doesn't compose fragments cleanly so
-    // we enumerate.
+    // we enumerate. #2200-class: the federated grant (sourceIds[]) leads and
+    // takes precedence over the scalar.
     const sourceId = opts?.sourceId;
     let rows;
-    if (source && sourceId) {
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      const ids = opts.sourceIds;
+      rows = source
+        ? await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
+          JOIN pages p ON p.id = rd.page_id
+          WHERE p.slug = ${slug} AND rd.source = ${source} AND p.source_id = ANY(${ids}::text[])`
+        : await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
+          JOIN pages p ON p.id = rd.page_id
+          WHERE p.slug = ${slug} AND p.source_id = ANY(${ids}::text[])`;
+    } else if (source && sourceId) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
         JOIN pages p ON p.id = rd.page_id
         WHERE p.slug = ${slug} AND rd.source = ${source} AND p.source_id = ${sourceId}`;
@@ -5362,9 +5385,19 @@ export class PostgresEngine implements BrainEngine {
     return rows[0] as unknown as PageVersion;
   }
 
-  async getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]> {
+  async getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]> {
     const sql = this.sql;
-    // v0.31.8 (D16): two-branch.
+    // v0.31.8 (D16): two-branch. #2200-class: the federated grant (sourceIds[])
+    // leads and takes precedence over the scalar.
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      const rows = await sql`
+        SELECT pv.* FROM page_versions pv
+        JOIN pages p ON p.id = pv.page_id
+        WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
+        ORDER BY pv.snapshot_at DESC
+      `;
+      return rows as unknown as PageVersion[];
+    }
     if (opts?.sourceId) {
       const rows = await sql`
         SELECT pv.* FROM page_versions pv

@@ -18,6 +18,9 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
+import { importCodeFile } from '../../src/core/import-file.ts';
+import { findCodeDef } from '../../src/commands/code-def.ts';
+import { findCodeRefs } from '../../src/commands/code-refs.ts';
 
 const SKIP_PG = !hasDatabase();
 const describeBoth = SKIP_PG ? describe.skip : describe;
@@ -825,8 +828,22 @@ async function seedFederated(eng: BrainEngine) {
   // F1: in-grant edge authored by an out-of-grant origin — origin_slug must null out.
   await eng.addLink('fed/doc', 'fed/target', 'originleak', 'mentions', 'frontmatter', 'fed/outside', 'related', { fromSourceId: 'beta', toSourceId: 'beta', originSourceId: 'default' });
   await eng.addTimelineEntry('fed/doc', { date: '2026-02-02', source: 't', summary: 'fed event', detail: 'd' }, { sourceId: 'beta' });
-  // Second-dated entry so the after/before fragment paths (D5A Postgres refactor) are exercised.
+  // Second-dated entry so the after/before fragment paths (D5A refactor) are exercised.
   await eng.addTimelineEntry('fed/doc', { date: '2026-08-08', source: 't', summary: 'late event', detail: 'd' }, { sourceId: 'beta' });
+  // #2200-class by-slug read ops: chunks, raw data, versions, code symbol.
+  await eng.upsertChunks('fed/doc', [{ chunk_index: 0, chunk_text: 'beta chunk body', chunk_source: 'compiled_truth' }], { sourceId: 'beta' });
+  await eng.upsertChunks('fed/doc', [{ chunk_index: 0, chunk_text: 'default decoy chunk body', chunk_source: 'compiled_truth' }], { sourceId: 'default' });
+  await eng.putRawData('fed/doc', 'crustdata', { side: 'beta' }, { sourceId: 'beta' });
+  await eng.createVersion('fed/doc', { sourceId: 'beta' });
+  // Code pages for findCodeDef/findCodeRefs parity: same symbol in two sources.
+  await importCodeFile(eng, 'src/parity-fixture.ts', `export function paritySymbol(): string {
+  return 'beta-side';
+}
+`, { noEmbed: true, sourceId: 'beta' });
+  await importCodeFile(eng, 'src/parity-fixture.ts', `export function paritySymbol(): string {
+  return 'default-side';
+}
+`, { noEmbed: true, sourceId: 'default' });
 }
 
 describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', () => {
@@ -890,5 +907,63 @@ describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', 
       const pglite = (await pgliteEngine.getTimeline('fed/doc', opts)).map(e => e.summary).sort();
       expect(pg).toEqual(pglite);
     }
+  });
+
+  // #2200-class by-slug read ops — same-slug cross-source bleed guard: under a
+  // grant of [beta], fed/doc reads must return the BETA data, never the
+  // 'default' decoy's (both engines wrote same-slug pages into two sources).
+  test('getChunks identical under sourceIds[] (default decoy excluded)', async () => {
+    const pg = (await pgEngine.getChunks('fed/doc', grant)).map(c => c.chunk_text).sort();
+    const pglite = (await pgliteEngine.getChunks('fed/doc', grant)).map(c => c.chunk_text).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg.join(' ')).not.toContain('decoy');
+    expect(pg.length).toBeGreaterThan(0);
+  });
+
+  test('getChunks scalar sourceId parity (default → decoy text visible)', async () => {
+    const pg = (await pgEngine.getChunks('fed/doc', { sourceId: 'default' })).map(c => c.chunk_text).sort();
+    const pglite = (await pgliteEngine.getChunks('fed/doc', { sourceId: 'default' })).map(c => c.chunk_text).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg.join(' ')).toContain('decoy');
+  });
+
+  test('getRawData identical under sourceIds[]', async () => {
+    const pg = (await pgEngine.getRawData('fed/doc', undefined, grant)).map(r => r.source).sort();
+    const pglite = (await pgliteEngine.getRawData('fed/doc', undefined, grant)).map(r => r.source).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual(['crustdata']); // seeded below
+  });
+
+  test('getVersions identical under sourceIds[] (one beta version, no decoy)', async () => {
+    const pg = (await pgEngine.getVersions('fed/doc', grant)).map(v => v.compiled_truth).sort();
+    const pglite = (await pgliteEngine.getVersions('fed/doc', grant)).map(v => v.compiled_truth).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual(['b']);
+  });
+
+  test('getVersions scalar sourceId parity (default → decoy version)', async () => {
+    const pg = (await pgEngine.getVersions('fed/doc', { sourceId: 'default' })).map(v => v.compiled_truth).sort();
+    const pglite = (await pgliteEngine.getVersions('fed/doc', { sourceId: 'default' })).map(v => v.compiled_truth).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual(['d']);
+  });
+
+  test('findCodeDef / findCodeRefs identical under sourceIds[]', async () => {
+    const pgDef = (await findCodeDef(pgEngine, 'paritySymbol', { sourceIds: ['beta'] })).map(d => d.snippet).sort();
+    const pgliteDef = (await findCodeDef(pgliteEngine, 'paritySymbol', { sourceIds: ['beta'] })).map(d => d.snippet).sort();
+    expect(pgDef).toEqual(pgliteDef);
+    expect(pgDef.join(' ')).toContain('beta-side');
+
+    const pgRefs = (await findCodeRefs(pgEngine, 'paritySymbol', { sourceIds: ['beta'] })).map(r => r.snippet).sort();
+    const pgliteRefs = (await findCodeRefs(pgliteEngine, 'paritySymbol', { sourceIds: ['beta'] })).map(r => r.snippet).sort();
+    expect(pgRefs).toEqual(pgliteRefs);
+    expect(pgRefs.join(' ')).toContain('beta-side');
+  });
+
+  test('findCodeDef scalar sourceId parity (default → decoy snippet)', async () => {
+    const pg = (await findCodeDef(pgEngine, 'paritySymbol', { sourceId: 'default' })).map(d => d.snippet).sort();
+    const pglite = (await findCodeDef(pgliteEngine, 'paritySymbol', { sourceId: 'default' })).map(d => d.snippet).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg.join(' ')).toContain('default-side');
   });
 });

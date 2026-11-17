@@ -2706,9 +2706,9 @@ const get_versions: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    const versions = await ctx.engine.getVersions(p.slug as string, sourceOpts);
+    // v0.31.8 (D20): thread ctx.sourceId. #2200-class: route through
+    // sourceScopeOpts so a federated grant reaches the engine too.
+    const versions = await ctx.engine.getVersions(p.slug as string, sourceScopeOpts(ctx));
     // Same takes-allow-list privacy boundary as get_page. Snapshots persist
     // historical compiled_truth verbatim, including the takes fence, so
     // a remote token bypassing get_page via /history would re-introduce
@@ -2799,9 +2799,9 @@ const get_raw_data: Operation = {
     source: { type: 'string', description: 'Filter by source' },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20 + D21): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, sourceOpts);
+    // v0.31.8 (D20 + D21): thread ctx.sourceId. #2200-class: route through
+    // sourceScopeOpts so a federated grant reaches the engine too.
+    return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, sourceScopeOpts(ctx));
   },
   scope: 'read',
 };
@@ -2831,9 +2831,9 @@ const get_chunks: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    return ctx.engine.getChunks(p.slug as string, sourceOpts);
+    // v0.31.8 (D20): thread ctx.sourceId. #2200-class: route through
+    // sourceScopeOpts so a federated grant reaches the engine too.
+    return ctx.engine.getChunks(p.slug as string, sourceScopeOpts(ctx));
   },
   scope: 'read',
 };
@@ -4428,11 +4428,32 @@ const code_def: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { findCodeDef } = await import('../commands/code-def.ts');
+    // #2200-class: brain-wide stays the DEFAULT for trusted local callers
+    // (the documented CLI contract; code-intel ops like code_refs share it).
+    // A remote caller is scoped to its grant via sourceScopeOpts — federated
+    // array (sourceIds[]) or scalar ctx.sourceId — so a federated client can't
+    // read code chunks outside its grant. Precedence matches the resolver
+    // ladder: grant > scalar. Fail-closed (same posture as
+    // resolveCodeIntelScope's empty-scope arm): a remote caller that arrives
+    // with NO source in scope is denied, never widened to brain-wide.
+    let scope: { sourceId?: string; sourceIds?: string[] } = {};
+    if (ctx.remote !== false) {
+      scope = sourceScopeOpts(ctx);
+      if (!scope.sourceId && !(scope.sourceIds && scope.sourceIds.length > 0)) {
+        throw new OperationError(
+          'permission_denied',
+          'No source in scope for code_def.',
+          'Specify source_id, or check your granted sources.',
+        );
+      }
+    }
     const defs = await findCodeDef(ctx.engine, p.symbol as string, {
       limit: (p.limit as number) ?? 20,
       language: (p.lang as string) || undefined,
+      ...scope,
     });
-    // code_def is brain-wide (not source-scoped); readiness is 'symbol' grain.
+    // code_def is brain-wide for local callers (not source-scoped); readiness
+    // is 'symbol' grain.
     const { resolveCodeReadiness } = await import('./code-graph-readiness.ts');
     const readiness = await resolveCodeReadiness(ctx.engine, { kind: 'symbol', count: defs.length });
     return { symbol: p.symbol as string, count: defs.length, status: readiness.status, ready: readiness.ready, defs };
@@ -4451,11 +4472,29 @@ const code_refs: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { findCodeRefs } = await import('../commands/code-refs.ts');
+    // #2200-class: brain-wide stays the DEFAULT for trusted local callers
+    // (the documented CLI contract). A remote caller is scoped to its grant
+    // and FAILS CLOSED when it arrives with no source in scope (mirrors
+    // code_def; a remote caller with no scope must not get brain-wide ILIKE
+    // scan results across every source).
+    let scope: { sourceId?: string; sourceIds?: string[] } = {};
+    if (ctx.remote !== false) {
+      scope = sourceScopeOpts(ctx);
+      if (!scope.sourceId && !(scope.sourceIds && scope.sourceIds.length > 0)) {
+        throw new OperationError(
+          'permission_denied',
+          'No source in scope for code_refs.',
+          'Specify source_id, or check your granted sources.',
+        );
+      }
+    }
     const refs = await findCodeRefs(ctx.engine, p.symbol as string, {
       limit: (p.limit as number) ?? 50,
       language: (p.lang as string) || undefined,
+      ...scope,
     });
-    // code_refs is brain-wide (not source-scoped); readiness is 'symbol' grain.
+    // code_refs is brain-wide for local callers (not source-scoped); readiness
+    // is 'symbol' grain.
     const { resolveCodeReadiness } = await import('./code-graph-readiness.ts');
     const readiness = await resolveCodeReadiness(ctx.engine, { kind: 'symbol', count: refs.length });
     return { symbol: p.symbol as string, count: refs.length, status: readiness.status, ready: readiness.ready, refs };

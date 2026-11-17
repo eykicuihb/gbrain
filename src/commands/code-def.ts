@@ -30,7 +30,7 @@ export interface CodeDefResult {
 export async function findCodeDef(
   engine: BrainEngine,
   symbol: string,
-  opts: { limit?: number; language?: string } = {},
+  opts: { limit?: number; language?: string; sourceId?: string; sourceIds?: string[] } = {},
 ): Promise<CodeDefResult[]> {
   const limit = opts.limit ?? 20;
   // v0.41 D2: SQL DDL targets (table/view/index/procedure/schema/database/
@@ -57,6 +57,25 @@ export async function findCodeDef(
     params.splice(1, 0, opts.language);
     whereLang = 'AND cc.language = $2';
   }
+  // #2200-class source scope. Brain-wide stays the default for trusted local
+  // callers (no scope passed) — that's the documented CLI contract. A federated
+  // grant (`sourceIds[]`) or scalar scope restricts the page lookup so a
+  // remote caller can't read code chunks outside its grant. Federated array
+  // takes precedence over the scalar.
+  // NOTE: `params` is initialized as [symbol, limit] — limit is already the
+  // last element, so scope params must be spliced BEFORE it. The 1-based
+  // placeholder is computed from the insertion index, not params.length
+  // (params.length would collide with LIMIT's placeholder).
+  let whereScope = '';
+  if (opts.sourceIds && opts.sourceIds.length > 0) {
+    const idx = params.length - 1;
+    params.splice(idx, 0, opts.sourceIds);
+    whereScope = `AND p.source_id = ANY($${idx + 1}::text[])`;
+  } else if (opts.sourceId) {
+    const idx = params.length - 1;
+    params.splice(idx, 0, opts.sourceId);
+    whereScope = `AND p.source_id = $${idx + 1}`;
+  }
   // Deterministic ordering: exact type matches first (functions before
   // export_statement wrappers), then page slug, then line number.
   const rows = await engine.executeRaw<{
@@ -70,6 +89,7 @@ export async function findCodeDef(
      JOIN pages p ON p.id = cc.page_id
      WHERE cc.symbol_name = $1
        ${whereLang}
+       ${whereScope}
        AND p.page_kind = 'code'
        AND cc.symbol_type IN ('${DEF_TYPES.join("','")}', 'export statement')
      ORDER BY

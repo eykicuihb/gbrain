@@ -36,7 +36,7 @@ export interface CodeRefResult {
 export async function findCodeRefs(
   engine: BrainEngine,
   symbol: string,
-  opts: { limit?: number; language?: string } = {},
+  opts: { limit?: number; language?: string; sourceId?: string; sourceIds?: string[] } = {},
 ): Promise<CodeRefResult[]> {
   const limit = opts.limit ?? 50;
   const params: unknown[] = [`%${symbol}%`];
@@ -44,6 +44,19 @@ export async function findCodeRefs(
   if (opts.language) {
     params.push(opts.language);
     whereLang = `AND cc.language = $${params.length}`;
+  }
+  // #2200-class source scope. Brain-wide stays the default for trusted local
+  // callers (no scope passed) — that's the documented CLI contract. A federated
+  // grant (`sourceIds[]`) or scalar scope restricts the page lookup so a
+  // remote caller can't read code chunks outside its grant. Federated array
+  // takes precedence over the scalar.
+  let whereScope = '';
+  if (opts.sourceIds && opts.sourceIds.length > 0) {
+    params.splice(1, 0, opts.sourceIds);
+    whereScope = `AND p.source_id = ANY($${params.length}::text[])`;
+  } else if (opts.sourceId) {
+    params.splice(1, 0, opts.sourceId);
+    whereScope = `AND p.source_id = $${params.length}`;
   }
   params.push(limit);
   const rows = await engine.executeRaw<{
@@ -60,6 +73,7 @@ export async function findCodeRefs(
      WHERE p.page_kind = 'code'
        AND cc.chunk_text ILIKE $1
        ${whereLang}
+       ${whereScope}
      ORDER BY p.slug, cc.start_line NULLS LAST
      LIMIT $${params.length}`,
     params,
