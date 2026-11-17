@@ -45,9 +45,14 @@ export function formatResultExplain(
 
   // base_score is the pre-boost RRF+cosine result. When undefined
   // (result wasn't routed through runPostFusionStages), fall back to
-  // final score and label "no boosts applied" downstream.
+  // final score and label "no boosts applied" downstream. When the true
+  // vector cosine stamp is present (cosineReScore), show it too — the
+  // evidence classifier grounds high_vector_match on THIS number, not the
+  // blended base, so the dedup decision is auditable in --explain.
   const base = result.base_score ?? result.score;
-  lines.push(`   base=${fmt(base)} (rrf+cosine)`);
+  lines.push(result.vector_cosine !== undefined
+    ? `   base=${fmt(base)} (rrf+cosine blend) | vector_cosine=${fmt(result.vector_cosine)}`
+    : `   base=${fmt(base)} (rrf+cosine)`);
 
   let anyBoost = false;
 

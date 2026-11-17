@@ -2199,7 +2199,12 @@ async function cosineReScore(
       console.error(`[search-debug] ${r.slug}:${r.chunk_id} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);
     }
 
-    return { ...r, score: blended };
+    // Evidence-calibration stamp: carry the TRUE cosine forward so
+    // classifyEvidence grounds high_vector_match on a real semantic signal
+    // rather than inferring it from the blended base_score (the evidence
+    // TODO's core fix — base_score is an RRF+keyword/title/alias mix, not a
+    // cosine, so a generic high scorer could read as create_safety='exists').
+    return { ...r, score: blended, vector_cosine: cosine };
   }).sort((a, b) => b.score - a.score);
 }
 

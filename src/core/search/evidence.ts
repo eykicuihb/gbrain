@@ -16,8 +16,10 @@
  * Evidence precedence (strongest signal wins):
  *   alias_hit          — query exactly matched the page's declared chosen name
  *   exact_title_match  — query is a phrase in the page title (title boost fired)
- *   high_vector_match  — base (pre-boost) score >= HIGH_MATCH_FLOOR
- *   keyword_exact      — surfaced with a solid score but no title/alias/vector tag
+ *   high_vector_match  — TRUE vector cosine >= VECTOR_COSINE_FLOOR (grounded;
+ *                        legacy: blended base_score >= HIGH_MATCH_FLOOR when
+ *                        the cosine stamp is absent)
+ *   keyword_exact      — solid score but no title/alias/vector tag
  *   weak_semantic      — everything else (low-confidence tail)
  *
  * create_safety:
@@ -42,9 +44,36 @@ export const HIGH_MATCH_FLOOR = 0.85;
 /** base_score at/above this is a solid (not weak) match. */
 export const SOLID_MATCH_FLOOR = 0.6;
 
+/** True query↔chunk cosine at/above this is a confident semantic match.
+ *  Cosine of real embedding pairs concentrates ~[0.3, 0.6]; >= 0.75 is a
+ *  strong same-subject hit. Chosen below the OLD blended band (0.85) because
+ *  this threshold is grounded on a calibrated per-pair signal, not a pipeline
+ *  score whose distribution varies with pool depth and list counts. */
+export const VECTOR_COSINE_FLOOR = 0.75;
+/** True cosine at/above this is a solid (not weak) semantic match. */
+export const VECTOR_COSINE_SOLID = 0.5;
+
+/**
+ * Evidence precedence (strongest signal wins). v0.42.68 calibration: the
+ * vector arm is grounded on the TRUE query↔chunk cosine (`vector_cosine`,
+ * stamped by cosineReScore) when present — base_score is the pre-boost
+ * RRF/keyword/title/alias PIPELINE score, not a pure cosine, so a generic
+ * high scorer could previously read as create_safety='exists'. When the
+ * cosine stamp is absent (keyword-only paths, image-only queries, or callers
+ * that predate the stamp), the legacy base_score bands apply unchanged so
+ * no caller regresses.
+ */
 export function classifyEvidence(r: SearchResult): Evidence {
   if (r.alias_hit) return 'alias_hit';
   if (r.title_match_boost && r.title_match_boost > 1.0) return 'exact_title_match';
+  // Grounded vector arm: true cosine when the re-score stage stamped it.
+  if (typeof r.vector_cosine === 'number' && Number.isFinite(r.vector_cosine)) {
+    if (r.vector_cosine >= VECTOR_COSINE_FLOOR) return 'high_vector_match';
+    if (r.vector_cosine >= VECTOR_COSINE_SOLID) return 'keyword_exact';
+    return 'weak_semantic';
+  }
+  // Legacy fallback: blended pre-boost pipeline score bands (pre-calibration
+  // behavior, preserved verbatim for callers without the cosine stamp).
   const base = typeof r.base_score === 'number' ? r.base_score : r.score;
   if (Number.isFinite(base) && base >= HIGH_MATCH_FLOOR) return 'high_vector_match';
   if (Number.isFinite(base) && base >= SOLID_MATCH_FLOOR) return 'keyword_exact';

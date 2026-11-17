@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { classifyEvidence, createSafetyFor, stampEvidence, HIGH_MATCH_FLOOR, SOLID_MATCH_FLOOR } from '../../src/core/search/evidence.ts';
+import { classifyEvidence, createSafetyFor, stampEvidence, HIGH_MATCH_FLOOR, SOLID_MATCH_FLOOR, VECTOR_COSINE_FLOOR, VECTOR_COSINE_SOLID } from '../../src/core/search/evidence.ts';
 import type { SearchResult } from '../../src/core/types.ts';
 
 function r(partial: Partial<SearchResult>): SearchResult {
@@ -32,6 +32,51 @@ describe('classifyEvidence precedence', () => {
   });
   test('falls back to score when base_score absent', () => {
     expect(classifyEvidence(r({ score: 0.95, base_score: undefined }))).toBe('high_vector_match');
+  });
+});
+
+describe('classifyEvidence — grounded vector_cosine arm (calibration TODO fix)', () => {
+  test('true cosine >= floor → high_vector_match, even when the blended base_score is low', () => {
+    // The TODO's failure mode, inverted: a LOW blended pipeline score that
+    // hides a genuinely strong semantic match now reads correctly.
+    expect(classifyEvidence(r({ vector_cosine: VECTOR_COSINE_FLOOR, base_score: 0.3 }))).toBe('high_vector_match');
+    expect(classifyEvidence(r({ vector_cosine: 0.9, base_score: 0.3 }))).toBe('high_vector_match');
+  });
+
+  test('THE TODO CASE — generic high base_score WITHOUT a strong true cosine no longer reads as exists', () => {
+    // base_score 0.86 cleared the old blended band → create_safety='exists'
+    // even though the real cosine says the chunk is only weakly related.
+    const genericHigh = r({ base_score: 0.86, vector_cosine: 0.35 });
+    expect(classifyEvidence(genericHigh)).toBe('weak_semantic');
+    expect(createSafetyFor(classifyEvidence(genericHigh))).toBe('unknown');
+  });
+
+  test('cosine in the solid band → keyword_exact/probable', () => {
+    expect(classifyEvidence(r({ vector_cosine: VECTOR_COSINE_SOLID, base_score: 0.9 }))).toBe('keyword_exact');
+    expect(classifyEvidence(r({ vector_cosine: 0.6, base_score: 0.9 }))).toBe('keyword_exact');
+  });
+
+  test('cosine below the solid band → weak_semantic regardless of base_score', () => {
+    expect(classifyEvidence(r({ vector_cosine: 0.2, base_score: 0.99 }))).toBe('weak_semantic');
+  });
+
+  test('alias_hit and exact_title_match still outrank the cosine arm', () => {
+    expect(classifyEvidence(r({ alias_hit: true, vector_cosine: 0.1 }))).toBe('alias_hit');
+    expect(classifyEvidence(r({ title_match_boost: 1.25, vector_cosine: 0.1 }))).toBe('exact_title_match');
+  });
+
+  test('non-finite cosine falls through to the legacy base_score bands', () => {
+    expect(classifyEvidence(r({ vector_cosine: NaN, base_score: 0.86 }))).toBe('high_vector_match');
+    expect(classifyEvidence(r({ vector_cosine: undefined, base_score: 0.86 }))).toBe('high_vector_match');
+  });
+
+  test('stampEvidence propagates the grounded labels', () => {
+    const rs = [r({ vector_cosine: 0.8 }), r({ vector_cosine: 0.3, base_score: 0.99 })];
+    stampEvidence(rs);
+    expect(rs[0].evidence).toBe('high_vector_match');
+    expect(rs[0].create_safety).toBe('exists');
+    expect(rs[1].evidence).toBe('weak_semantic');
+    expect(rs[1].create_safety).toBe('unknown');
   });
 });
 

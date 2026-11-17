@@ -779,6 +779,17 @@ export interface SearchResult {
    */
   /** RRF + cosine score BEFORE any boost stage mutated it. */
   base_score?: number;
+  /**
+   * Evidence-calibration signal — the TRUE query↔chunk cosine similarity
+   * computed during the cosine re-score stage (cosineReScore), stamped so
+   * `classifyEvidence` grounds `high_vector_match` on a real semantic signal
+   * instead of inferring it from the blended pre-boost pipeline score
+   * (base_score is RRF+keyword/title/alias mix, NOT a pure cosine — a generic
+   * high scorer could previously read as create_safety='exists'). Undefined
+   * when no cosine re-score ran (keyword-only paths, image-only queries, or
+   * pre-existing rows) — evidence then falls back to the base_score bands.
+   */
+  vector_cosine?: number;
   /** Multiplier applied by applyBacklinkBoost (1.0 = unchanged). */
   backlink_boost?: number;
   /** Multiplier applied by applySalienceBoost. */
