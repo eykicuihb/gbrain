@@ -13,6 +13,7 @@ import {
   parseSourceConfig,
   normalizeSourceConfig,
   isSourceFederated,
+  sourceLocalPathSkipWarning,
 } from '../src/core/sources-load.ts';
 
 let engine: PGLiteEngine;
@@ -194,5 +195,57 @@ describe('isSourceFederated', () => {
     expect(isSourceFederated({})).toBe(false);
     expect(isSourceFederated(null)).toBe(false);
     expect(isSourceFederated(['{"remote_url":"x"}', { federated: true }])).toBe(true);
+  });
+});
+
+describe('sourceLocalPathSkipWarning', () => {
+  test('keeps existing absolute checkouts dispatchable', () => {
+    expect(sourceLocalPathSkipWarning('present', '/repos/brain', (p) => p === '/repos/brain')).toBeNull();
+  });
+
+  test('skips relative local_path rows before consulting the filesystem', () => {
+    const asked: string[] = [];
+    const warn = sourceLocalPathSkipWarning('legacy', 'notes/brain', (p) => {
+      asked.push(p);
+      return true;
+    });
+    expect(asked).toEqual([]);
+    expect(warn).toContain("source 'legacy'");
+    expect(warn).toContain('relative local_path');
+    // /ship coverage audit (GBRA-207, #7630).
+    // Value: protects=the skip names the fix that works (sources set-path <id> <absolute-directory>), never "run gbrain sync once to self-heal";
+    //   fails_when=the advice reverts to the pre-#7630 sync self-heal, which now refuses sync_anchor_relative; why_new=no test read the advice
+    //   (only "relative local_path" and "cannot be resolved from a daemon"); seam=none; no_claim=none beyond protects
+    expect(warn).toContain("gbrain sources set-path legacy <absolute-directory>");
+    expect(warn).not.toContain('self-heal');
+  });
+
+  test('skips absolute paths missing from this machine', () => {
+    const warn = sourceLocalPathSkipWarning('foreign', '/missing/brain', () => false);
+    expect(warn).toContain("source 'foreign'");
+    expect(warn).toContain('/missing/brain');
+    expect(warn).toContain('does not exist on this machine');
+  });
+
+  test('allows missing managed remote clones to reach sync recovery', () => {
+    expect(
+      sourceLocalPathSkipWarning(
+        'managed',
+        '/missing/managed',
+        () => false,
+        { remote_url: 'https://github.com/example/repo', managed_clone: true },
+      ),
+    ).toBeNull();
+  });
+
+  test('still skips missing unowned remote-url paths', () => {
+    const warn = sourceLocalPathSkipWarning(
+      'foreign',
+      '/Users/other/repo',
+      () => false,
+      { remote_url: 'https://github.com/example/repo' },
+    );
+    expect(warn).toContain("source 'foreign'");
+    expect(warn).toContain('does not exist on this machine');
   });
 });

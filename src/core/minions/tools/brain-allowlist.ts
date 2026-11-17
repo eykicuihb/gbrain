@@ -18,64 +18,34 @@
  * dispatcher bug where viaSubagent=true but subagentId is missing.
  *
  * In v0.15 every allow-list op is treated as idempotent for the two-phase
- * replay path. put_page with a deterministic slug is idempotent at the row
+ * replay path. put_page with its persisted request UUID is idempotent at the journal
  * level; repeats re-derive the same embedding over identical content.
  */
 
+import { budgetedPageRead } from './read-budget.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { operations } from '../../operations.ts';
-import type { Operation, OperationContext } from '../../operations.ts';
+import type { AuthInfo, Operation, OperationContext } from '../../operations.ts';
 import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
+import { normalizeOptionalParams, validateParams } from '../../../mcp/validate-params.ts';
 import { validateSourceId } from '../../utils.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
+import { putPageRejection, rethrowWithCurrentRevision } from './put-page-result.ts';
+import { BRAIN_TOOL_ALLOWLIST } from './brain-tool-allowlist.ts';
+import { stagePutPage } from './staged-put-page.ts';
+import { withCallerAccess } from '../../search/private-visibility.ts';
+import { remoteCallerAccess } from '../../access/caller.ts';
+import { credentialScopeFor, requesterScopeGate, requiresRequesterScope, withServesReread } from '../../access/requester-scope.ts';
+import { attestedCallerAccess, attestRightOf, storedActorIdentity } from '../../access/actor.ts';
+import { attestedReadMode, scopeReadAccess, withReadMode } from '../../access/scope-read.ts';
+import { attestedReadScope } from '../../access/member-sources.ts';
+import type { AudiencePrincipal } from '../../access/audience.ts';
+import { currentSubmissionAuthority } from '../submission-authority.ts';
 
-/**
- * v0.15 brain-tool allow-list. Review carefully when extending. Op names
- * verified against origin/master:src/core/operations.ts (post shell-jobs +
- * Knowledge Runtime).
- *
- * Read-only (all safe):
- *   query, search, get_page, list_pages, file_list, file_url,
- *   get_backlinks, traverse_graph, resolve_slugs, get_ingest_log
- *
- * Conditional write:
- *   put_page (namespace-enforced by the tool schema + server-side check)
- *
- * Every name below MUST exist in src/core/operations.ts OPERATIONS; the
- * brain-allowlist test pins this invariant so an upstream rename fails CI
- * instead of silently dropping a tool.
- */
-export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
-  'query',
-  'search',
-  'get_page',
-  'list_pages',
-  'file_list',
-  'file_url',
-  'get_backlinks',
-  'traverse_graph',
-  // v114 (#1941): read-only provenance discovery. Edge-WRITE ops (add_link /
-  // remove_link) are deliberately NOT allowlisted — exposing graph writes to
-  // subagents is a separate trust decision.
-  'list_link_sources',
-  'resolve_slugs',
-  'get_ingest_log',
-  'put_page',
-  // #2778: the canonical timeline-write op. Fenced exactly like put_page —
-  // operations.ts:enforceSubagentSlugFence confines the target slug to the
-  // trusted-workspace allow-list (or the wiki/agents/<id>/ namespace) when
-  // ctx.viaSubagent=true, so a subagent can only append timeline entries to
-  // pages it could have written anyway.
-  'add_timeline_entry',
-  // v0.29 — Salience + Anomaly Detection. Both read-only. `get_recent_transcripts`
-  // is intentionally NOT included: subagent calls always have ctx.remote=true,
-  // and the v0.29 trust gate rejects remote callers — adding it here would be
-  // a footgun (subagent calls op, gets permission_denied, looks like a bug).
-  // The cycle synthesize phase already calls discoverTranscripts directly.
-  'get_recent_salience',
-  'find_anomalies',
-]);
+// The allow-list itself lives in a handler-free module so the MCP surface
+// tiers (src/mcp/surface.ts) can read it without this module's operations import.
+export { BRAIN_TOOL_ALLOWLIST };
 
 /**
  * v0.41 Approach C: per-tool usage_hint surfaced verbatim in the subagent
@@ -96,8 +66,6 @@ export const BRAIN_TOOL_USAGE_HINTS: Readonly<Record<string, string>> = {
   search: 'Use for hybrid keyword + vector search returning ranked page hits. Use over `query` when you want page-level not chunk-level results (e.g. "find pages about X").',
   get_page: 'Read a brain page by its slug. Returns the full markdown body + frontmatter + linked pages.',
   list_pages: 'List pages by type or slug-prefix filter. Use when you need to enumerate (e.g. "list all `people/` pages") instead of search.',
-  file_list: 'List uploaded files (attachments) by slug-prefix or content type. NOT the local filesystem — only files the brain has stored.',
-  file_url: 'Get a presigned URL for a brain-stored file. Read-only; expires.',
   get_backlinks: 'List every page that links TO the given slug. Use for "what references this".',
   traverse_graph: 'Walk the typed-edge graph starting from a slug (e.g. `works_at`, `founded`, `invested_in`). Use for relationship queries.',
   list_link_sources: 'List the distinct link provenances in the brain with edge counts (e.g. `citation-graph`, `manual`). Use to discover which edge-writers have populated the graph.',
@@ -177,6 +145,11 @@ export interface BuildBrainToolsOpts {
   subagentId: number;
   engine: BrainEngine;
   config: GBrainConfig;
+  /**
+   * #4216 — defer chunk embeddings on put_page writes (oneshot programmatic
+   * writes only; the standing embed machinery backfills). Server-side flag.
+   */
+  deferEmbeds?: boolean;
   /** Optional filter: only include names in this set. */
   allowedNames?: ReadonlySet<string>;
   /**
@@ -197,18 +170,24 @@ export interface BuildBrainToolsOpts {
   /**
    * Trusted-workspace allow-list (v0.23). When set, put_page is bounded
    * to slugs matching these prefix globs instead of the legacy
-   * `wiki/agents/<id>/...` namespace. Trust comes from PROTECTED_JOB_NAMES
-   * (MCP can't submit subagent jobs) — this flows from
-   * SubagentHandlerData.allowed_slug_prefixes via the handler.
+   * `wiki/agents/<id>/...` namespace. Trusted local jobs get these from the
+   * submitter; remote-owned jobs get the validated grant intersection and
+   * delegatedAuth. Prefixes alone do not make a remote job trusted.
    */
   allowedSlugPrefixes?: readonly string[];
   /**
    * Brain source every tool-call OperationContext is scoped to (#1586).
-   * Trusted (flows from SubagentHandlerData.source_id, which only
-   * PROTECTED_JOB_NAMES-gated submitters can set); validated at build time.
+   * Remote-owned jobs also carry delegatedAuth.allowedSources so a per-call
+   * source_id cannot override this boundary. Validated at build time.
    * Unset → legacy 'default'.
    */
   sourceId?: string;
+  /** Current remote owner grant; never populated from caller tool arguments. */
+  delegatedAuth?: Pick<AuthInfo, 'clientId' | 'scopes' | 'sourceId' | 'allowedSources' | 'allowedOperations'>;
+  /** #6297: byte budget on this job's get_page results (SubagentHandlerData.read_budget_bytes); unset = none. */
+  readBudgetBytes?: number;
+  /** GBRA-60: put_page stages its page in the tool-execution ledger instead of writing it (SubagentHandlerData.stage_writes). */
+  stageWrites?: boolean;
 }
 
 interface OpContextDeps {
@@ -220,6 +199,8 @@ interface OpContextDeps {
   brainId?: string;
   allowedSlugPrefixes?: readonly string[];
   sourceId?: string;
+  deferEmbeds?: boolean;
+  delegatedAuth?: BuildBrainToolsOpts['delegatedAuth'];
 }
 
 function buildOpContext(deps: OpContextDeps): OperationContext {
@@ -235,6 +216,10 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     remote: true,                // match MCP trust boundary for auto-link skip
     // #1586: cycle-resolved source when provided; legacy host default else.
     sourceId: deps.sourceId ?? 'default',
+    // Preserve explicit per-call source checks without importing direct-write
+    // fences or requiring direct read/write scopes for agent-only grants.
+    ...(deps.delegatedAuth ? { auth: { token: '', ...deps.delegatedAuth,
+      principal: { kind: 'oauth_client' as const, id: deps.delegatedAuth.clientId } } } : {}),
     jobId: deps.jobId,
     subagentId: deps.subagentId,
     viaSubagent: true,           // FAIL-CLOSED: put_page etc. enforce namespace
@@ -242,6 +227,9 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     allowedSlugPrefixes: deps.allowedSlugPrefixes
       ? [...deps.allowedSlugPrefixes]
       : undefined,
+    // #4216: server-side-only — the oneshot runner defers chunk embeddings on
+    // its programmatic writes; never hydrated from any wire payload.
+    ...(deps.deferEmbeds ? { deferEmbeds: true } : {}),
   };
 }
 
@@ -255,7 +243,7 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
 export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
   const filter = opts.allowedNames ?? BRAIN_TOOL_ALLOWLIST;
   const picked: Operation[] = operations.filter(
-    op => BRAIN_TOOL_ALLOWLIST.has(op.name) && filter.has(op.name),
+    op => !op.localOnly && BRAIN_TOOL_ALLOWLIST.has(op.name) && filter.has(op.name),
   );
 
   // #1586: fail fast on a malformed source id before any tool executes
@@ -263,42 +251,109 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
   // through the job payload).
   if (opts.sourceId !== undefined) validateSourceId(opts.sourceId);
 
-  return picked.map<ToolDef>(op => {
-    const schema = op.name === 'put_page'
-      ? namespacedPutPageSchema(op, opts.subagentId, opts.allowedSlugPrefixes)
-      : paramsToInputSchema(op);
+  return picked.map(op => brainTool(op, opts));
+}
 
-    const toolName = sanitizeToolName(op.name);
-    if (!ANTHROPIC_NAME_RE.test(toolName)) {
-      throw new Error(`brain tool name ${toolName} does not match Anthropic constraint`);
-    }
+/**
+ * GBRA-60: the `put_pages` tool of a trusted dream synthesis child's oneshot runner, which writes its validated pages
+ * as one batch so a Postgres consumer publishes them as one group (one commit on a strict source). It is never in
+ * the registry a model sees: BRAIN_TOOL_ALLOWLIST keeps put_pages out, and the oneshot runner is its only caller.
+ */
+export function buildBrainPutPagesTool(opts: BuildBrainToolsOpts): ToolDef {
+  if (opts.sourceId !== undefined) validateSourceId(opts.sourceId);
+  return brainTool(operations.find(op => op.name === 'put_pages')!, opts);
+}
 
-    return {
-      name: toolName,
-      description: op.description,
-      input_schema: schema,
-      // v0.15 ships only idempotent brain tools (every allow-listed op is
-      // deterministic over its input; put_page re-writes the same slug).
-      idempotent: true,
-      // v0.41 Approach C: surface usage_hint to the system-prompt renderer.
-      // Keyed by the unprefixed op name. Undefined when no hint is registered.
-      usage_hint: BRAIN_TOOL_USAGE_HINTS[op.name],
-      async execute(input: unknown, ctx: ToolCtx): Promise<unknown> {
-        const opCtx = buildOpContext({
-          engine: ctx.engine,
-          config: opts.config,
-          subagentId: opts.subagentId,
-          jobId: ctx.jobId,
-          signal: ctx.signal,
-          brainId: opts.brainId,
-          allowedSlugPrefixes: opts.allowedSlugPrefixes,
-          sourceId: opts.sourceId,
-        });
-        const params = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
-        return op.handler(opCtx, params);
-      },
-    };
-  });
+/** One subagent tool: `op` under a subagent-tagged OperationContext, with a namespace-wrapped schema for put_page. */
+function brainTool(op: Operation, opts: BuildBrainToolsOpts): ToolDef {
+  const schema = op.name === 'put_page'
+    ? namespacedPutPageSchema(op, opts.subagentId, opts.allowedSlugPrefixes)
+    : paramsToInputSchema(op);
+
+  const toolName = sanitizeToolName(op.name);
+  if (!ANTHROPIC_NAME_RE.test(toolName)) {
+    throw new Error(`brain tool name ${toolName} does not match Anthropic constraint`);
+  }
+
+  return {
+    name: toolName,
+    description: op.description,
+    input_schema: schema,
+    // The persisted tool dispatcher binds mutations to a stable request UUID;
+    // a replay returns the original durable receipt without another write.
+    idempotent: true,
+    // v0.41 Approach C: surface usage_hint to the system-prompt renderer.
+    // Keyed by the unprefixed op name. Undefined when no hint is registered.
+    usage_hint: BRAIN_TOOL_USAGE_HINTS[op.name],
+    async execute(input: unknown, ctx: ToolCtx): Promise<unknown> {
+      if (op.localOnly) throw new Error(`${toolName}: local-only operations cannot be delegated`);
+      const opCtx = buildOpContext({
+        engine: ctx.engine,
+        config: opts.config,
+        subagentId: opts.subagentId,
+        jobId: ctx.jobId,
+        signal: ctx.signal,
+        brainId: opts.brainId,
+        allowedSlugPrefixes: opts.allowedSlugPrefixes,
+        sourceId: opts.sourceId,
+        deferEmbeds: opts.deferEmbeds,
+        delegatedAuth: opts.delegatedAuth,
+      });
+      const raw = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
+      // Same order the MCP dispatchers keep: normalize the optional-param
+      // absent idioms (`null`, `''` on a string) FIRST — the validator's
+      // header calls this load-bearing — then validate, so a missing
+      // required param (or wrong type / unknown enum) is named back to the
+      // model instead of crashing inside the handler, and `since: ""` never
+      // reaches a handler raw.
+      const params = normalizeOptionalParams(op, raw);
+      // #6297: a subagent's full-content read returns the round-trip fields only, not the body twice.
+      if (op.name === 'get_page' && params.include_content === true) params.content_only = true;
+      const validationError = validateParams(op, params);
+      if (validationError) throw new Error(`${toolName}: ${validationError}`);
+      const write = op.name === 'put_page' && opts.stageWrites ? stagePutPage : op.handler;
+      const run = (c: typeof opCtx = opCtx) => op.name === 'put_page'
+        ? write(c, params).catch(e => rethrowWithCurrentRevision(ctx.engine, c.sourceId ?? 'default', params.slug, e))
+        : op.handler(c, params);
+      // GBRA-218: a remote-owned job reads as its client's member, looked up live on every call (a disabled member or
+      // removed binding takes effect at the next tool call); never a GBRA-156 private-pages grant.
+      // GBRA-231: a job a shared agent submitted for an audience reads as that audience, re-checked the same way.
+      const submitted = currentSubmissionAuthority();
+      const actingFor = submitted?.kind === 'remote_agent' ? submitted.grant.actingFor as AudiencePrincipal[] | undefined : undefined;
+      // GST-359 C1: a job submitted for an attested actor reads as that member only while actorCoverage still covers it.
+      const agent = submitted?.kind === 'remote_agent' ? submitted : undefined;
+      const actor = agent?.grant.actor;
+      // GST-1158 E1: and a job tool call that names sources reads them as the scope, exactly as the same call through MCP dispatch.
+      const output = agent && actor
+        ? await (async () => {
+          const identity = await storedActorIdentity(ctx.engine, agent.principal, actor, op.name);
+          const readMode = attestedReadMode(op.name, params, (await attestRightOf(ctx.engine, { principal: agent.principal }))?.read);
+          const access = readMode === 'scope' ? await scopeReadAccess(ctx.engine) : await attestedCallerAccess(ctx.engine, actor, identity);
+          return withCallerAccess(access, () => withReadMode(readMode, async () => run(await attestedReadScope(ctx.engine, opCtx, actor.member, readMode === 'scope'))));
+        })()
+        : opCtx.auth
+        ? await withCallerAccess(await scopedJobAccess(ctx.engine, op, opCtx.auth, actingFor), run)
+        : await run();
+      const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
+      if (rejection) throw new Error(rejection);
+      if (op.name === 'get_page' && opts.readBudgetBytes) return budgetedPageRead(ctx.engine, ctx.jobId, opts.readBudgetBytes, params.slug, output);
+      return output;
+    },
+  };
+}
+
+/**
+ * The caller access of a remote-owned job's tool call. GST-363: the same requester-scope gate as dispatch, read live
+ * on every call: on a brain that serves several people, a read by a job whose credential is bound to nobody (and that
+ * names no audience) is refused with requester_scope_required once the grace ends; during it the call runs.
+ */
+async function scopedJobAccess(engine: BrainEngine, op: Operation, auth: NonNullable<OperationContext['auth']>, actingFor: AudiencePrincipal[] | undefined) {
+  const access = await remoteCallerAccess(engine, auth, [], undefined, actingFor, undefined, op.mutating === false);
+  if (!requiresRequesterScope(op, auth)) return access;
+  const credential = await credentialScopeFor(engine, auth);
+  const resolved = await withServesReread(engine, access, credential);
+  requesterScopeGate(op, resolved, credential, 'http');
+  return resolved;
 }
 
 /**
@@ -328,6 +383,15 @@ export function filterAllowedTools(registry: ToolDef[], allowedToolNames: string
     picked.push(match);
   }
   return picked;
+}
+
+/** An absent trusted binding uses the registry; an explicit empty binding grants nothing. */
+export function selectAllowedTools(registry: ToolDef[], allowed: unknown): ToolDef[] {
+  if (allowed === undefined) return registry;
+  if (!Array.isArray(allowed) || allowed.some(name => typeof name !== 'string' || name.trim() === '')) {
+    throw new Error('subagent allowed_tools must be an array of nonempty tool names');
+  }
+  return filterAllowedTools(registry, allowed);
 }
 
 /** Exported for unit tests (stable surface). */

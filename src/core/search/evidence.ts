@@ -16,10 +16,12 @@
  * Evidence precedence (strongest signal wins):
  *   alias_hit          — query exactly matched the page's declared chosen name
  *   exact_title_match  — query is a phrase in the page title (title boost fired)
- *   high_vector_match  — TRUE vector cosine >= VECTOR_COSINE_FLOOR (grounded;
- *                        legacy: blended base_score >= HIGH_MATCH_FLOOR when
- *                        the cosine stamp is absent)
- *   keyword_exact      — solid score but no title/alias/vector tag
+ *   high_vector_match  — base (pre-boost) score >= HIGH_MATCH_FLOOR
+ *   keyword_exact      — surfaced by a strict lexical arm (keyword/title FTS,
+ *                        keyword_hit=true, not keyword_relaxed) with a solid
+ *                        score (#3783 — a solid blended score alone no longer
+ *                        earns this label); in keyword mode (GBRA-449) any
+ *                        strict keyword row, whatever its score
  *   weak_semantic      — everything else (low-confidence tail)
  *
  * create_safety:
@@ -39,45 +41,79 @@ export type Evidence =
 
 export type CreateSafety = 'exists' | 'probable' | 'unknown';
 
-/** base_score (pre-boost) at/above this is a confident vector/keyword match. */
+/**
+ * Legacy pre-v0.46.15 floor — kept exported for back-compat, but
+ * `high_vector_match` no longer keys off it: base_score is a blended
+ * RRF/keyword/title/alias composite, NOT a cosine, so a generic
+ * high-scoring page could read as a confident vector match (#3963,
+ * TODOS retrieval-cathedral P1).
+ */
 export const HIGH_MATCH_FLOOR = 0.85;
 /** base_score at/above this is a solid (not weak) match. */
 export const SOLID_MATCH_FLOOR = 0.6;
-
-/** True query↔chunk cosine at/above this is a confident semantic match.
- *  Cosine of real embedding pairs concentrates ~[0.3, 0.6]; >= 0.75 is a
- *  strong same-subject hit. Chosen below the OLD blended band (0.85) because
- *  this threshold is grounded on a calibrated per-pair signal, not a pipeline
- *  score whose distribution varies with pool depth and list counts. */
-export const VECTOR_COSINE_FLOOR = 0.75;
-/** True cosine at/above this is a solid (not weak) semantic match. */
-export const VECTOR_COSINE_SOLID = 0.5;
-
 /**
- * Evidence precedence (strongest signal wins). v0.42.68 calibration: the
- * vector arm is grounded on the TRUE query↔chunk cosine (`vector_cosine`,
- * stamped by cosineReScore) when present — base_score is the pre-boost
- * RRF/keyword/title/alias PIPELINE score, not a pure cosine, so a generic
- * high scorer could previously read as create_safety='exists'. When the
- * cosine stamp is absent (keyword-only paths, image-only queries, or callers
- * that predate the stamp), the legacy base_score bands apply unchanged so
- * no caller regresses.
+ * v0.46.15 — `high_vector_match` fires ONLY on a real query↔chunk cosine at/
+ * above this floor (SearchResult.cosine, hydrated from the active embedding
+ * column). Config-overridable via `search.evidence_cosine_floor`; the default
+ * is calibrated for the current default embedding columns — per-model
+ * calibration is a filed follow-up. Keyless/hermetic runs have no cosine and
+ * honestly fall through to keyword_exact/weak_semantic (create_safety
+ * degrades exists→probable, the safe direction for the don't-duplicate
+ * contract).
  */
-export function classifyEvidence(r: SearchResult): Evidence {
+export const DEFAULT_HIGH_COSINE_FLOOR = 0.8;
+
+export interface EvidenceOpts {
+  /** Cosine floor for high_vector_match (default DEFAULT_HIGH_COSINE_FLOOR). */
+  cosineFloor?: number;
+  /**
+   * GBRA-449: the rows come from a keyword-mode search (search `match: "keyword"`;
+   * not the operator's `search.mcp_keyword_only` route), where every strict row satisfies the query as the
+   * caller wrote it, its own OR included. Such a row (unless it matched only an
+   * entity name the engine added, `matched_alias`) is keyword_exact whatever its
+   * score; normalized ts_rank for an OR or one-word query sits far under
+   * SOLID_MATCH_FLOOR. create_safety still follows the score floor.
+   */
+  keywordMode?: boolean;
+}
+
+export function classifyEvidence(r: SearchResult, opts: EvidenceOpts = {}): Evidence {
   if (r.alias_hit) return 'alias_hit';
   if (r.title_match_boost && r.title_match_boost > 1.0) return 'exact_title_match';
-  // Grounded vector arm: true cosine when the re-score stage stamped it.
-  if (typeof r.vector_cosine === 'number' && Number.isFinite(r.vector_cosine)) {
-    if (r.vector_cosine >= VECTOR_COSINE_FLOOR) return 'high_vector_match';
-    if (r.vector_cosine >= VECTOR_COSINE_SOLID) return 'keyword_exact';
-    return 'weak_semantic';
+  const floor = typeof opts.cosineFloor === 'number' ? opts.cosineFloor : DEFAULT_HIGH_COSINE_FLOOR;
+  if (typeof r.cosine === 'number' && Number.isFinite(r.cosine) && r.cosine >= floor) {
+    return 'high_vector_match';
   }
-  // Legacy fallback: blended pre-boost pipeline score bands (pre-calibration
-  // behavior, preserved verbatim for callers without the cosine stamp).
+  // #3783 — keyword_exact requires ACTUAL lexical-arm membership
+  // (keyword_hit stamped pre-fusion by markKeywordHits, OR-propagated
+  // through RRF). Pre-fix, any base_score >= SOLID_MATCH_FLOOR was labeled
+  // keyword_exact with zero keyword verification, so a pure-vector row with
+  // a solid blended score lied to the agent about WHY it matched. Rows
+  // without the flag (incl. legacy cached rows) honestly degrade to
+  // weak_semantic — create_safety 'unknown', the safe look-closer direction.
+  // gbrain-evals A4-2: an OR-relaxed lexical row (keyword_relaxed, the
+  // zero-strict-recall fallback) matched some query terms, not the query, so
+  // it is not lexically verified.
   const base = typeof r.base_score === 'number' ? r.base_score : r.score;
-  if (Number.isFinite(base) && base >= HIGH_MATCH_FLOOR) return 'high_vector_match';
-  if (Number.isFinite(base) && base >= SOLID_MATCH_FLOOR) return 'keyword_exact';
+  // GBRA-449: keyword mode waives the floor for a row that matched the caller's own statement, not an engine-added
+  // name (matched_alias: the row matched only one of the entity's other names the engine ORed into the query).
+  const callersOwnMatch = opts.keywordMode === true && !r.matched_alias;
+  if (r.keyword_hit === true && r.keyword_relaxed !== true && (callersOwnMatch || (Number.isFinite(base) && base >= SOLID_MATCH_FLOOR))) {
+    return 'keyword_exact';
+  }
   return 'weak_semantic';
+}
+
+/**
+ * #3783 — stamp lexical-arm membership on rows a keyword/title FTS query
+ * surfaced. Called on the raw arm output BEFORE fusion (hybrid pipeline) or
+ * before stampEvidence (direct keyword-only consumers: MCP keyword-only
+ * opt-out, no-embedding fallbacks, entity near-miss suggestions). Mutates in
+ * place, idempotent. RRF fusion OR-propagates the flag so a row that also
+ * appeared in a vector list keeps it regardless of merge order.
+ */
+export function markKeywordHits(results: SearchResult[]): void {
+  for (const r of results) r.keyword_hit = true;
 }
 
 export function createSafetyFor(evidence: Evidence): CreateSafety {
@@ -96,12 +132,14 @@ export function createSafetyFor(evidence: Evidence): CreateSafety {
 /**
  * Stamp `evidence` + `create_safety` on every result in place. Called once at
  * the end of the hybrid pipeline (after the alias hop, before slice) so the
- * agent-facing result carries the contract. Idempotent.
+ * agent-facing result carries the contract. Idempotent. GBRA-449: create_safety
+ * is derived from the label without `keywordMode`, so a keyword-mode row
+ * relabelled keyword_exact under the score floor keeps the `unknown` it had.
  */
-export function stampEvidence(results: SearchResult[]): void {
+export function stampEvidence(results: SearchResult[], opts: EvidenceOpts = {}): void {
   for (const r of results) {
-    const e = classifyEvidence(r);
+    const e = classifyEvidence(r, opts);
     r.evidence = e;
-    r.create_safety = createSafetyFor(e);
+    r.create_safety = createSafetyFor(opts.keywordMode ? classifyEvidence(r, { ...opts, keywordMode: false }) : e);
   }
 }

@@ -4,7 +4,7 @@
  * coverage lives in test/e2e/sources-remote-mcp.test.ts.
  */
 
-import { test, expect, describe, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { test, expect, describe, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
 import {
   mkdirSync,
   writeFileSync,
@@ -112,11 +112,10 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  // resetPgliteState re-seeds the default source row (tests that rely on the
+  // v0.17 row get it from there; a second ON CONFLICT DO NOTHING insert here
+  // was always a no-op).
   await resetPgliteState(engine);
-  // Make sure the default source exists for tests that rely on the v0.17 row.
-  await engine.executeRaw(
-    `INSERT INTO sources (id, name, local_path, config) VALUES ('default', 'default', NULL, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
-  );
   // Reset GBRAIN_HOME fixtures between tests
   rmSync(GBRAIN_HOME, { recursive: true, force: true });
   mkdirSync(GBRAIN_HOME, { recursive: true });
@@ -140,7 +139,8 @@ async function withEnv2<T>(fn: () => Promise<T>): Promise<T> {
 describe('addSource — Q4 pre-flight collision', () => {
   test('rejects existing id BEFORE any clone work', async () => {
     await withEnv2(async () => {
-      await addSource(engine, { id: 'taken', localPath: '/tmp/a' });
+      const absent = join(tmpdir(), `gbrain-q4-absent-${process.pid}-${Date.now()}`);
+      await addSource(engine, { id: 'taken', localPath: absent });
       try {
         await addSource(engine, {
           id: 'taken',
@@ -840,9 +840,32 @@ describe('addSource --path — #2707 git-repo validation', () => {
     rmSync(SANDBOX, { recursive: true, force: true });
   });
 
-  test('rejects an existing non-git directory with an actionable error', async () => {
+  test('registers an existing plain directory outside any git repository without --force (GST-2732)', async () => {
+    const plainDir = join(SANDBOX, 'plain-ok');
+    mkdirSync(plainDir, { recursive: true });
+    writeFileSync(join(plainDir, 'notes.md'), 'a plain folder');
+    const row = await addSource(engine, { id: 'plain-ok-src', localPath: plainDir });
+    expect(row.local_path).toBe(plainDir);
+  });
+
+  test('a folder with a .git entry that git cannot read is not a plain folder: refused like sync would treat it (GST-2732)', async () => {
+    const brokenDir = join(SANDBOX, 'broken-gitlink');
+    mkdirSync(brokenDir, { recursive: true });
+    writeFileSync(join(brokenDir, '.git'), 'gitdir: /nonexistent/gbrain-gst2732\n');
+    writeFileSync(join(brokenDir, 'notes.md'), 'inside a checkout git cannot open');
+    let threw: SourceOpError | undefined;
+    try {
+      await addSource(engine, { id: 'broken-gitlink-src', localPath: brokenDir });
+    } catch (e) {
+      threw = e as SourceOpError;
+    }
+    expect(threw?.code).toBe('not_a_git_repo');
+  });
+
+  test('rejects a git repository with untracked files only, with an actionable error', async () => {
     const plainDir = join(SANDBOX, 'plain');
     mkdirSync(plainDir, { recursive: true });
+    execFileSync('git', ['-C', plainDir, 'init', '-q']);
     writeFileSync(join(plainDir, 'notes.md'), 'not committed anywhere');
 
     let threw: SourceOpError | undefined;
@@ -1006,6 +1029,7 @@ describe('addSource --path — #2707 git-repo validation', () => {
   test('quotes a path with a space in the remediation command (codex round 1)', async () => {
     const spacedDir = join(SANDBOX, 'has space here');
     mkdirSync(spacedDir, { recursive: true });
+    execFileSync('git', ['-C', spacedDir, 'init', '-q']);
 
     let threw: SourceOpError | undefined;
     try {
@@ -1067,6 +1091,162 @@ describe('addSource --path — #2707 git-repo validation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// addSource --path — #3903 attach path to an existing path-less source
+//
+// `gbrain sync --source X` on a no-local_path source prints
+// "Run: gbrain sources add X --path <path>", but addSource used to throw
+// source_id_taken for ANY existing id — the only recovery it offered was
+// `sources remove --confirm-destructive`, which cascades page deletion.
+// Attaching a local_path to an existing row with local_path IS NULL is
+// non-destructive and is exactly what the sync hint promises.
+//
+// Runs OUTSIDE withEnv2 (real system git) because the attach path reuses the
+// #2707 git validation, which the fake-git harness defeats.
+// ---------------------------------------------------------------------------
+
+describe('addSource --path — #3903 attach to existing path-less source', () => {
+  const SANDBOX = join(tmpdir(), `gbrain-3903-attach-${process.pid}`);
+
+  function makeGitRepo(name: string): string {
+    const dir = join(SANDBOX, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'README.md'), '# fixture');
+    execFileSync('git', ['-C', dir, 'init', '-q']);
+    execFileSync('git', ['-C', dir, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', dir, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', dir, 'add', '-A']);
+    execFileSync('git', ['-C', dir, 'commit', '-q', '-m', 'initial import']);
+    return dir;
+  }
+
+  beforeEach(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+    mkdirSync(SANDBOX, { recursive: true });
+  });
+  afterAll(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+  });
+
+  test('attach happy path: NULL local_path + --path updates the row, keeps config', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('attach-me', 'Attach Me', NULL, '{"federated":true}'::jsonb)`,
+    );
+    const gitDir = makeGitRepo('attach-happy');
+    const row = await addSource(engine, { id: 'attach-me', localPath: gitDir });
+    expect(row.id).toBe('attach-me');
+    expect(row.local_path).toBe(gitDir);
+    // Attach is an UPDATE, not a re-INSERT: name + config survive.
+    expect(row.name).toBe('Attach Me');
+    expect((row.config as any).federated).toBe(true);
+  });
+
+  test('attach applies explicitly-passed --name and --federated (review: not silently dropped)', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('attach-flags', 'Old Name', NULL, '{"federated":true,"other":"kept"}'::jsonb)`,
+    );
+    const gitDir = makeGitRepo('attach-flags');
+    const row = await addSource(engine, {
+      id: 'attach-flags',
+      localPath: gitDir,
+      name: 'New Name',
+      federated: false, // explicit false must override the stored true
+    });
+    expect(row.local_path).toBe(gitDir);
+    expect(row.name).toBe('New Name');
+    expect((row.config as any).federated).toBe(false);
+    // Merge, not replace: unrelated config keys survive the attach.
+    expect((row.config as any).other).toBe('kept');
+  });
+
+  test('attach still runs the #2707 git validation (not_a_git_repo unless --force)', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('attach-plain', 'x', NULL, '{}'::jsonb)`,
+    );
+    const plainDir = join(SANDBOX, 'plain-attach');
+    mkdirSync(plainDir, { recursive: true });
+    execFileSync('git', ['-C', plainDir, 'init', '-q']);
+
+    let threw: SourceOpError | undefined;
+    try {
+      await addSource(engine, { id: 'attach-plain', localPath: plainDir });
+    } catch (e) {
+      threw = e as SourceOpError;
+    }
+    expect(threw).toBeInstanceOf(SourceOpError);
+    expect(threw?.code).toBe('not_a_git_repo');
+    // Row untouched (local_path still NULL).
+    const rows = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id = 'attach-plain'`,
+    );
+    expect(rows[0]?.local_path).toBeNull();
+
+    // --force attaches anyway (same escape hatch as fresh registration).
+    const row = await addSource(engine, { id: 'attach-plain', localPath: plainDir, force: true });
+    expect(row.local_path).toBe(plainDir);
+  });
+
+  test('attach runs the overlap check against other sources', async () => {
+    const gitDir = makeGitRepo('overlap-owner');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('overlap-owner', 'overlap-owner', $1, '{}'::jsonb)`,
+      [gitDir],
+    );
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('attach-overlap', 'attach-overlap', NULL, '{}'::jsonb)`,
+    );
+    let threw: SourceOpError | undefined;
+    try {
+      await addSource(engine, { id: 'attach-overlap', localPath: gitDir });
+    } catch (e) {
+      threw = e as SourceOpError;
+    }
+    expect(threw).toBeInstanceOf(SourceOpError);
+    expect(threw?.code).toBe('overlapping_path');
+  });
+
+  test('taken-WITH-path still throws, and the message warns remove deletes pages', async () => {
+    const gitDir = makeGitRepo('already-pathed');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('has-path', 'x', $1, '{}'::jsonb)`,
+      [gitDir],
+    );
+    let threw: SourceOpError | undefined;
+    try {
+      await addSource(engine, { id: 'has-path', localPath: join(SANDBOX, 'elsewhere') });
+    } catch (e) {
+      threw = e as SourceOpError;
+    }
+    expect(threw).toBeInstanceOf(SourceOpError);
+    expect(threw?.code).toBe('source_id_taken');
+    expect(threw?.message).toMatch(/deletes every page/i);
+  });
+
+  test('NULL local_path + --url does NOT attach (still source_id_taken)', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+         VALUES ('attach-url', 'x', NULL, '{}'::jsonb)`,
+    );
+    let threw: SourceOpError | undefined;
+    try {
+      await addSource(engine, {
+        id: 'attach-url',
+        remoteUrl: 'https://github.com/example/repo',
+      });
+    } catch (e) {
+      threw = e as SourceOpError;
+    }
+    expect(threw).toBeInstanceOf(SourceOpError);
+    expect(threw?.code).toBe('source_id_taken');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // isPathContained — symlink-safe confinement helper (exported for reuse)
 // ---------------------------------------------------------------------------
 
@@ -1105,5 +1285,107 @@ describe('isPathContained', () => {
 
   test('returns false for missing paths (fail-closed)', () => {
     expect(isPathContained(join(SANDBOX, 'never'), SANDBOX)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.46 github-kind source registration (Path C in addSource): a fresh mirror
+// is federated by default so unqualified search/query span it, unless the
+// caller explicitly passes federated:false.
+// ---------------------------------------------------------------------------
+
+describe('addSource github kind', () => {
+  beforeEach(async () => {
+    await resetPgliteState(engine);
+  });
+
+  async function addGithubSource(federated?: boolean | null) {
+    const ghDir = join(CLONE_ROOT, 'ghsrc-github');
+    await addSource(engine, {
+      id: 'ghsrc',
+      ...(federated !== undefined ? { federated } : {}),
+      github: {
+        tokenEnv: 'GH_TOKEN',
+        handle: 'example-handle',
+        scope: 'repos',
+        repos: ['example/repo'],
+        dir: ghDir,
+        involvement: false,
+      },
+    });
+    const rows = await engine.executeRaw<{ config: unknown }>(
+      `SELECT config FROM sources WHERE id = 'ghsrc'`,
+    );
+    return rows[0]?.config as Record<string, unknown>;
+  }
+
+  test('defaults to federated:true (searchable alongside the vault)', async () => {
+    const config = await addGithubSource();
+    expect(config.federated).toBe(true);
+  });
+
+  test('explicit federated:false opts out of unqualified reads', async () => {
+    const config = await addGithubSource(false);
+    expect(config.federated).toBe(false);
+  });
+
+  test('github mirror is not reported as a broken git clone', async () => {
+    await addGithubSource();
+    const status = await getSourceStatus(engine, 'ghsrc');
+    expect(status.clone_state).toBe('not-applicable');
+  });
+});
+
+describe('#7630 — a relative clone local_path never names the current directory', () => {
+  async function insideRelativeClone(id: string, config: Record<string, unknown>, fn: (dir: string) => Promise<void>): Promise<void> {
+    await withEnv2(async () => {
+      const dir = join(CLONE_ROOT, `${id}-cwd`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'KEEP_ME.md'), 'another clone lives here');
+      await engine.executeRaw(
+        'INSERT INTO sources (id, name, local_path, config) VALUES ($1, $1, $2, $3::jsonb)',
+        [id, '.', JSON.stringify(config)],
+      );
+      const previous = process.cwd();
+      process.chdir(dir);
+      try { await fn(dir); } finally { process.chdir(previous); }
+    });
+  }
+
+  test('removeSource skips clone cleanup and leaves the current directory', async () => {
+    await insideRelativeClone('rel-remove', { remote_url: 'https://github.com/example/repo' }, async dir => {
+      const result = await removeSource(engine, { id: 'rel-remove', confirmDestructive: true });
+      expect(result.clone_removed).toBe(false);
+      expect(existsSync(join(dir, 'KEEP_ME.md'))).toBe(true);
+    });
+  });
+
+  test('recloneIfMissing refuses unmanaged_path and leaves the current directory', async () => {
+    await insideRelativeClone('rel-reclone', { remote_url: 'https://github.com/example/repo', managed_clone: true }, async dir => {
+      let threw: SourceOpError | null = null;
+      try { await recloneIfMissing(engine, 'rel-reclone'); } catch (e) { threw = e as SourceOpError; }
+      expect(threw?.code).toBe('unmanaged_path');
+      expect(threw?.message).toContain('gbrain sources set-path rel-reclone');
+      expect(existsSync(join(dir, 'KEEP_ME.md'))).toBe(true);
+      expect(readdirSync(dir)).toEqual(['KEEP_ME.md']);
+    });
+  });
+
+  // #7646: the skipped cleanup is reported in the result (remote sources_remove sees only that) and the warning names gbrain's
+  // own clone directory, which a later sources add <id> --url refuses while it holds files.
+  test('removeSource reports clone_skipped_reason and names the clone directory it left', async () => {
+    await insideRelativeClone('rel-orphan', { remote_url: 'https://github.com/example/repo', managed_clone: true }, async dir => {
+      const cloneDir = defaultCloneDir('rel-orphan');
+      mkdirSync(cloneDir, { recursive: true });
+      writeFileSync(join(cloneDir, 'README.md'), 'the clone gbrain made');
+      const errors: string[] = [];
+      const spy = spyOn(console, 'error').mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
+      let result: Awaited<ReturnType<typeof removeSource>>;
+      try { result = await removeSource(engine, { id: 'rel-orphan', confirmDestructive: true }); } finally { spy.mockRestore(); }
+      expect(result).toMatchObject({ clone_removed: false, clone_skipped_reason: 'relative_path' });
+      expect(errors.join('\n')).toContain(`gbrain's clone directory for this source is ${cloneDir}`);
+      expect(existsSync(join(cloneDir, 'README.md'))).toBe(true);
+      expect(existsSync(join(dir, 'KEEP_ME.md'))).toBe(true);
+    });
   });
 });

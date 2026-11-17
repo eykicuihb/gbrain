@@ -13,7 +13,8 @@
  * Fixes under test:
  *   C1 — engine.searchTitles: page-grain candidates from pages.search_vector
  *        (title weight 'A'), joined to one representative chunk, fused into
- *        hybridSearch as a keyword-class RRF list. No query-length gate.
+ *        hybridSearch as a keyword-class RRF list. Human-sized long title
+ *        queries stay intact; oversized pasted context is bounded.
  *   C2 — searchKeyword retries ONCE with OR-of-terms when strict AND
  *        returns zero rows; strict results always win when non-empty.
  *
@@ -24,10 +25,17 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
-import { buildOrFallbackWebsearchQuery } from '../../src/core/search/sql-ranking.ts';
-import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { __setTitleWholeVectorCandidatesForTests, titleWholeVectorCandidates } from '../../src/core/search/title-statement.ts';
+import {
+  MAX_WEBSEARCH_QUERY_CHARS,
+  MAX_WEBSEARCH_QUERY_TERMS,
+  boundWebsearchQuery,
+  buildOrFallbackWebsearchQuery,
+} from '../../src/core/search/sql-ranking.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -48,12 +56,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
-  // Restore the preload-equivalent gateway for sibling files in this shard.
-  configureGateway({
-    embedding_model: 'openai:text-embedding-3-large',
-    embedding_dimensions: DIM,
-    env: { ...process.env },
-  });
+  // R5: restore the preload baseline for sibling files in this shard; resetGateway()
+  // re-applies the registered baseline factory, so it cannot drift from it.
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -67,7 +72,7 @@ async function seedTitleOnlyPage(): Promise<void> {
     title: 'Chronomancer Codex Ledger',
     compiled_truth: 'A reference document about scheduling practices and planning.',
   });
-  await engine.upsertChunks('projects/chronomancer', [
+  await installFixtureChunks(engine, 'projects/chronomancer', [
     {
       chunk_index: 0,
       chunk_text: 'A reference document about scheduling practices and planning.',
@@ -103,12 +108,22 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: longTitle,
       compiled_truth: 'An annual planning artifact.',
     });
-    await engine.upsertChunks('reports/emerald-falcon', [
+    await installFixtureChunks(engine, 'reports/emerald-falcon', [
       { chunk_index: 0, chunk_text: 'An annual planning artifact.', chunk_source: 'compiled_truth' },
     ]);
 
     const hits = await engine.searchTitles(longTitle, { limit: 10 });
     expect(hits.map(r => r.slug)).toContain('reports/emerald-falcon');
+  });
+
+  test('oversized pasted context is bounded before title FTS while preserving early terms', async () => {
+    await seedTitleOnlyPage();
+    const filler = Array.from({ length: 5000 }, (_, i) => `oversizedtoken${i}`).join(' ');
+    const hugeQuery = `Chronomancer Codex Ledger ${filler}`;
+    expect(hugeQuery.length).toBeGreaterThan(MAX_WEBSEARCH_QUERY_CHARS);
+
+    const hits = await engine.searchTitles(hugeQuery, { limit: 10 });
+    expect(hits.map(r => r.slug)).toContain('projects/chronomancer');
   });
 
   test('representative chunk prefers compiled_truth, else lowest chunk_index', async () => {
@@ -117,7 +132,7 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: 'Obsidian Waterfall Registry',
       compiled_truth: 'body text here',
     });
-    await engine.upsertChunks('notes/mixed-chunks', [
+    await installFixtureChunks(engine, 'notes/mixed-chunks', [
       { chunk_index: 0, chunk_text: 'timeline entry text', chunk_source: 'timeline' },
       { chunk_index: 1, chunk_text: 'compiled body text', chunk_source: 'compiled_truth' },
     ]);
@@ -131,13 +146,52 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: 'Cobalt Meridian Atlas',
       compiled_truth: 'unrelated body',
     });
-    await engine.upsertChunks('notes/timeline-only', [
+    await installFixtureChunks(engine, 'notes/timeline-only', [
       { chunk_index: 5, chunk_text: 'later timeline', chunk_source: 'timeline' },
       { chunk_index: 2, chunk_text: 'earlier timeline', chunk_source: 'timeline' },
     ]);
     const tlHits = await engine.searchTitles('Cobalt Meridian Atlas', { limit: 5 });
     const tlHit = tlHits.find(r => r.slug === 'notes/timeline-only')!;
     expect(tlHit.chunk_index).toBe(2); // lowest index when no compiled_truth chunk
+  });
+
+  // #7135 made the local OR re-run title-only so a date in a question could not pull every dated timeline into
+  // ranking. GST-2899 keeps that bound by size instead: the re-run reads timelines while every matching page fits
+  // the title cap, and titles only past it.
+  test('a local OR re-run reads timelines only while the matches fit the cap: past it a timeline word is not a relaxed title hit (#7135, GST-2899)', async () => {
+    await engine.putPage('people/dated-entity', {
+      type: 'person',
+      title: 'Cobalt Meridian Atlas',
+      compiled_truth: 'unrelated body',
+      timeline: '- 2026-10-07: zircon quarry visit',
+    });
+    await installFixtureChunks(engine, 'people/dated-entity', [
+      { chunk_index: 0, chunk_text: 'unrelated body', chunk_source: 'compiled_truth' },
+    ]);
+    const inVector = await (engine as any).db.query(
+      `SELECT search_vector @@ to_tsquery('english', 'zircon') AS hit FROM pages WHERE slug = 'people/dated-entity'`,
+    );
+    expect(inVector.rows[0].hit).toBe(true);
+
+    for (const n of [1, 2]) {
+      await engine.putPage('notes/dated-' + n, { type: 'note', title: 'Dated note ' + n, compiled_truth: 'unrelated body', timeline: '- 2026-10-07: zircon quarry visit' });
+      await installFixtureChunks(engine, 'notes/dated-' + n, [{ chunk_index: 0, chunk_text: 'unrelated body', chunk_source: 'compiled_truth' }]);
+    }
+    const slugs = async (q: string) => (await engine.searchTitles(q, { limit: 10 })).map(r => r.slug);
+    // Three pages hold the timeline words: under the cap the re-run returns them.
+    expect((await slugs('zircon nebulith')).sort()).toEqual(['notes/dated-1', 'notes/dated-2', 'people/dated-entity']);
+    const cap = titleWholeVectorCandidates();
+    __setTitleWholeVectorCandidatesForTests(2);
+    try {
+      // Three matches do not fit a cap of two, so the re-run matches titles only, as #7135 left it.
+      expect(await slugs('zircon nebulith')).toEqual([]);
+      expect(await slugs('quarry nebulith')).toEqual([]);
+      expect(await slugs('Cobalt nebulith')).toEqual(['people/dated-entity']);
+    } finally {
+      __setTitleWholeVectorCandidatesForTests(cap);
+    }
+    expect(await slugs('Cobalt Meridian')).toContain('people/dated-entity');
+    expect(await slugs('Cobalt zircon')).toContain('people/dated-entity');
   });
 
   test('respects soft-delete visibility and source scoping', async () => {
@@ -162,6 +216,9 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: 'Zanzibar Protocol Manifest',
       compiled_truth: 'fixture body',
     });
+    await installFixtureChunks(engine, 'test/hidden-fixture', [
+      { chunk_index: 0, chunk_text: 'fixture body', chunk_source: 'compiled_truth' },
+    ]);
     const hits = await engine.searchTitles('Zanzibar Protocol Manifest', { limit: 10 });
     expect(hits.map(r => r.slug)).not.toContain('test/hidden-fixture');
   });
@@ -174,7 +231,7 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
       title: 'Quantum Notes',
       compiled_truth: 'quantum lattice harmonics resonance experiments',
     });
-    await engine.upsertChunks('notes/quantum', [
+    await installFixtureChunks(engine, 'notes/quantum', [
       {
         chunk_index: 0,
         chunk_text: 'quantum lattice harmonics resonance experiments',
@@ -208,7 +265,7 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
       title: 'Partial Overlap',
       compiled_truth: 'quantum computing conference recap',
     });
-    await engine.upsertChunks('notes/partial', [
+    await installFixtureChunks(engine, 'notes/partial', [
       { chunk_index: 0, chunk_text: 'quantum computing conference recap', chunk_source: 'compiled_truth' },
     ]);
 
@@ -227,6 +284,39 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
     await seedQuantumPage();
     const hits = await engine.searchKeyword('zzznothinghere', { limit: 10, orFallback: true });
     expect(hits.length).toBe(0);
+  });
+});
+
+describe('hybridSearch — search.keywordOrFallback knob (v=25)', () => {
+  // Title deliberately shares no token with the query so the D1 title arm
+  // can't rescue the page — isolates the keyword arm's OR retry, which is
+  // what the knob gates.
+  async function seedLabJournal(): Promise<void> {
+    await engine.putPage('notes/lab-journal', {
+      type: 'note',
+      title: 'Lab Journal',
+      compiled_truth: 'quantum lattice harmonics resonance experiments',
+    });
+    await installFixtureChunks(engine, 'notes/lab-journal', [
+      {
+        chunk_index: 0,
+        chunk_text: 'quantum lattice harmonics resonance experiments',
+        chunk_source: 'compiled_truth',
+      },
+    ]);
+  }
+
+  test('bundle default (on): the OR retry rescues through the full hybrid path', async () => {
+    await seedLabJournal();
+    const results = await hybridSearch(engine, 'quantum lattice harmonics zzzmissingtoken', { limit: 10 });
+    expect(results.map(r => r.slug)).toContain('notes/lab-journal');
+  });
+
+  test('search.keywordOrFallback=false suppresses the OR retry end-to-end', async () => {
+    await seedLabJournal();
+    await engine.setConfig('search.keywordOrFallback', 'false');
+    const results = await hybridSearch(engine, 'quantum lattice harmonics zzzmissingtoken', { limit: 10 });
+    expect(results.map(r => r.slug)).not.toContain('notes/lab-journal');
   });
 });
 
@@ -249,11 +339,35 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
   test('interior hyphens are not operators — still relaxed', () => {
     expect(buildOrFallbackWebsearchQuery('alpha-beta gamma')).toBe('alpha OR beta OR gamma');
   });
+  test('drops repeated words: a repeat adds no match and only multiplies ts_rank work (#7135)', () => {
+    expect(buildOrFallbackWebsearchQuery('idle tab idle reaper')).toBe('idle OR tab OR reaper');
+    expect(buildOrFallbackWebsearchQuery('Idle idle IDLE')).toBeNull();
+  });
   test('drops literal OR/AND words so they cannot re-parse as operators', () => {
     expect(buildOrFallbackWebsearchQuery('alpha or beta')).toBe('alpha OR beta');
     expect(buildOrFallbackWebsearchQuery('alpha AND beta')).toBe('alpha OR beta');
     // Only operator words survive tokenization → nothing left to relax.
     expect(buildOrFallbackWebsearchQuery('or and')).toBeNull();
+  });
+});
+
+describe('boundWebsearchQuery — pure', () => {
+  test('leaves ordinary title-sized queries unchanged', () => {
+    const q = 'Chronomancer Codex Ledger';
+    expect(boundWebsearchQuery(q)).toBe(q);
+  });
+
+  test('caps by term count without dropping the early useful prefix', () => {
+    const q = Array.from({ length: MAX_WEBSEARCH_QUERY_TERMS + 10 }, (_, i) => `term${i}`).join(' ');
+    const bounded = boundWebsearchQuery(q);
+    expect(bounded).toContain('term0');
+    expect(bounded).toContain(`term${MAX_WEBSEARCH_QUERY_TERMS - 1}`);
+    expect(bounded).not.toContain(`term${MAX_WEBSEARCH_QUERY_TERMS + 1}`);
+  });
+
+  test('caps very long single-token input by character length', () => {
+    const q = 'x'.repeat(MAX_WEBSEARCH_QUERY_CHARS + 100);
+    expect(boundWebsearchQuery(q).length).toBe(MAX_WEBSEARCH_QUERY_CHARS);
   });
 });
 
@@ -271,7 +385,7 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
       title: longTitle,
       compiled_truth: 'An annual planning artifact.',
     });
-    await engine.upsertChunks('reports/emerald-falcon', [
+    await installFixtureChunks(engine, 'reports/emerald-falcon', [
       { chunk_index: 0, chunk_text: 'An annual planning artifact.', chunk_source: 'compiled_truth' },
     ]);
     const results = await hybridSearch(engine, longTitle, { limit: 5 });
@@ -292,5 +406,52 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
     expect((await engine.searchKeyword(q, { limit: 5 })).length).toBe(0);
     const results = await hybridSearch(engine, q, { limit: 5 });
     expect(results.map(r => r.slug)).toContain('projects/chronomancer');
+  });
+});
+
+describe('hybridSearch wiring — search.qualified_aliases and search.title_qualified (keyless, repo-less)', () => {
+  async function seed(): Promise<void> {
+    await engine.putPage('projects/codename-falcon', { type: 'project', title: 'Codename Falcon', compiled_truth: 'Quarterly figures.' });
+    await engine.setPageAliases('projects/codename-falcon', 'default', ['acme widget project']);
+    await engine.putPage('people/alice-example', { type: 'person', title: 'Alice Example', compiled_truth: 'Leads the widget team at acme. Owns the roadmap and the budget.' });
+    await engine.putPage('notes/status', { type: 'note', title: 'Status', compiled_truth: 'Widget team status at acme with alice example mentioned, roadmap budget roadmap.' });
+    for (const slug of ['projects/codename-falcon', 'people/alice-example', 'notes/status']) {
+      const page = await engine.getPage(slug);
+      await installFixtureChunks(engine, slug, [{ chunk_index: 0, chunk_text: page!.compiled_truth, chunk_source: 'compiled_truth' }]);
+    }
+  }
+  const off = async () => {
+    await engine.setConfig('search.qualified_aliases', 'false');
+    await engine.setConfig('search.title_qualified', 'false');
+  };
+
+  test('qualified_aliases: off leaves the alias page out; on injects it first, with evidence short of exists', async () => {
+    await seed();
+    const q = 'status of the acme widget project today';
+    try {
+      expect((await hybridSearch(engine, q, { limit: 5 })).map(r => r.slug)).not.toContain('projects/codename-falcon');
+      await engine.setConfig('search.qualified_aliases', 'true');
+      const on = await hybridSearch(engine, q, { limit: 5 });
+      expect(on[0].slug).toBe('projects/codename-falcon');
+      expect(on[0].qualified_alias_hit).toBe(true);
+      expect(on[0].alias_hit).toBeUndefined();
+      expect(on[0].evidence).not.toBe('alias_hit');
+      expect(on[0].create_safety).not.toBe('exists');
+    } finally { await off(); }
+  });
+
+  test('title_qualified: a person title inside the query gets title_mention_boost only when on, never an exact-title evidence', async () => {
+    await seed();
+    const q = 'acme widget team lead alice example roadmap budget';
+    try {
+      const before = (await hybridSearch(engine, q, { limit: 5 })).find(r => r.slug === 'people/alice-example');
+      expect(before?.title_mention_boost).toBeUndefined();
+      await engine.setConfig('search.title_qualified', 'true');
+      const after = (await hybridSearch(engine, q, { limit: 5 })).find(r => r.slug === 'people/alice-example');
+      expect(after?.title_mention_boost).toBe(1.25);
+      expect(after?.title_match_boost).toBeUndefined();
+      expect(after?.evidence).not.toBe('exact_title_match');
+      expect(after?.create_safety).not.toBe('exists');
+    } finally { await off(); }
   });
 });
